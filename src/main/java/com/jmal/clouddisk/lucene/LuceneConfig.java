@@ -19,7 +19,8 @@ import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.SearcherFactory;
 import org.apache.lucene.search.SearcherManager;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.FSLockFactory;
+import org.apache.lucene.store.NIOFSDirectory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -65,14 +66,14 @@ public class LuceneConfig {
      */
     @Bean
     public Directory luceneDirectory() throws IOException {
-        return FSDirectory.open(getIndexDir());
+        return new NIOFSDirectory(getIndexDir(), FSLockFactory.getDefault());
     }
 
     /**
      * 创建一个用于精确子串匹配的 N-Gram Analyzer 实例
      * 策略: KeywordTokenizer -> LowerCaseFilter (可选) -> NGramTokenFilter
      */
-    @Bean("ngramAnalyzer") // 给它一个不同的名字，以便注入
+    @Bean("ngramAnalyzer")
     public Analyzer ngramAnalyzer() {
         return new Analyzer() {
             @Override
@@ -127,6 +128,8 @@ public class LuceneConfig {
 
         IndexWriterConfig indexWriterConfig = new IndexWriterConfig(wrapperAnalyzer);
         indexWriterConfig.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
+        indexWriterConfig.setRAMBufferSizeMB(64); // 设置内存缓冲区大小，单位为MB
+        indexWriterConfig.setRAMPerThreadHardLimitMB(32); // 设置每个线程的内存限制，单位为MB
         this.indexWriterInstance = new IndexWriter(directory, indexWriterConfig);
         return this.indexWriterInstance;
     }
@@ -151,14 +154,14 @@ public class LuceneConfig {
 
     @PreDestroy
     public void destroy() {
-        log.info("Shutting down Lucene components...");
+        log.debug("Shutting down Lucene components...");
 
         // 1. 关闭 NRT Reopen 线程 (它会尝试关闭 SearcherManager)
         if (this.controlledRealTimeReopenThread != null) {
             try {
                 log.debug("Closing ControlledRealTimeReopenThread...");
                 this.controlledRealTimeReopenThread.close(); // 这个close()会等待线程结束
-                log.info("ControlledRealTimeReopenThread closed.");
+                log.debug("ControlledRealTimeReopenThread closed.");
             } catch (Exception e) { // InterruptedException or IOException
                 log.error("Error closing ControlledRealTimeReopenThread: {}", e.getMessage(), e);
             }
@@ -186,7 +189,7 @@ public class LuceneConfig {
                 log.error("Error closing IndexWriter: {}", e.getMessage(), e);
             }
         }
-        log.info("Lucene components shutdown complete.");
+        log.debug("Lucene components shutdown complete.");
     }
 }
 

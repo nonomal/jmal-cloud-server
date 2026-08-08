@@ -1,24 +1,25 @@
 package com.jmal.clouddisk.util;
 
-import cn.hutool.core.date.TimeInterval;
-import cn.hutool.core.io.CharsetDetector;
 import cn.hutool.core.io.FileTypeUtil;
 import cn.hutool.core.io.FileUtil;
+import cn.hutool.core.util.CharsetUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.crypto.digest.DigestAlgorithm;
 import com.jmal.clouddisk.service.Constants;
 import lombok.extern.slf4j.Slf4j;
-import org.mozilla.universalchardet.UniversalDetector;
 
+import java.io.ByteArrayInputStream;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.PipedInputStream;
+import java.io.PipedOutputStream;
 import java.nio.charset.Charset;
-import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.Arrays;
-import java.util.List;
+import java.util.Set;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
 
 /**
  * @author jmal
@@ -28,19 +29,18 @@ import java.util.List;
 @Slf4j
 public class MyFileUtils {
 
-    public static List<String> hasContentTypes = Arrays.asList("pdf", "drawio", "mind", "doc", "docx", "xls", "xlsx", "xlsm", "ppt", "pptx", "csv", "tsv", "dotm", "xlt", "xltm", "dot", "dotx", "xlam", "xla", "pages", "epub", "dwg");
+    public static Set<String> hasContentTypes = Set.of("pdf", "drawio", "mind", "doc", "docx", "xls", "xlsx", "xlsm", "ppt", "pptx", "csv", "tsv", "dotm", "xlt", "xltm", "dot", "dotx", "xlam", "xla", "pages", "epub");
+
+    private static final Set<String> BINARY_TYPE_KEYWORDS = Set.of(
+            Constants.VIDEO,
+            Constants.CONTENT_TYPE_IMAGE,
+            Constants.AUDIO,
+            "zip", "rar", "7z", "tar", "gz", "bz2", "xz"
+    );
+
 
     private MyFileUtils() {
 
-    }
-
-    public static void main(String[] args) throws IOException, NoSuchAlgorithmException {
-        System.out.println(extName("file"));
-        File file1 = new File("/Users/jmal/Downloads/归档.zip");
-        File file2 = new File("/Users/jmal/Downloads/归档.zip");
-        TimeInterval timer = new TimeInterval();
-        System.out.println(hashEquals(file1.getAbsolutePath(), file2.getAbsolutePath()));
-        System.out.println(timer.interval());
     }
 
     public static String extName(File file) {
@@ -51,53 +51,28 @@ public class MyFileUtils {
         return FileUtil.extName(fileName).toLowerCase();
     }
 
+    private static boolean isBinaryOrCompressedType(String contentType) {
+        return BINARY_TYPE_KEYWORDS.stream()
+                .anyMatch(contentType::contains);
+    }
+
     public static boolean hasCharset(File file) {
+        return getCharset(file) != null;
+    }
+
+    public static Charset getCharset(File file) {
         try {
-            if (file == null) {
-                return false;
+            if (file == null || file.isDirectory()) {
+                return null;
             }
             String suffix = MyFileUtils.extName(file.getName());
             String contentType = FileContentTypeUtils.getContentType(suffix);
-            if (file.isDirectory()) {
-                return false;
+            if (isBinaryOrCompressedType(contentType)) {
+                return null;
             }
-            if (contentType.contains(Constants.VIDEO)) {
-                return false;
-            }
-            if (contentType.contains(Constants.CONTENT_TYPE_IMAGE)) {
-                return false;
-            }
-            if (contentType.contains(Constants.AUDIO)) {
-                return false;
-            }
-            if (contentType.contains("zip")) {
-                return false;
-            }
-            if (contentType.contains("rar")) {
-                return false;
-            }
-            if (contentType.contains("7z")) {
-                return false;
-            }
-            if (contentType.contains("tar")) {
-                return false;
-            }
-            if (contentType.contains("gz")) {
-                return false;
-            }
-            if (contentType.contains("bz2")) {
-                return false;
-            }
-            if (contentType.contains("xz")) {
-                return false;
-            }
-            // 大于250M的文件不检查
-            if (file.length() > 250 * 1024 * 1024) {
-                return false;
-            }
-            return CharsetDetector.detect(file) != null;
+            return CharsetDetector.detect(file);
         } catch (Exception e) {
-            return false;
+            return null;
         }
     }
 
@@ -107,12 +82,7 @@ public class MyFileUtils {
      * @return 字符编码
      */
     public static Charset getFileCharset(File file) {
-        try {
-            String charset = UniversalDetector.detectCharset(file);
-            return StrUtil.isBlank(charset) ? StandardCharsets.UTF_8 : Charset.forName(charset);
-        } catch (Exception e) {
-            return StandardCharsets.UTF_8;
-        }
+        return CharsetDetector.detect(file);
     }
 
     public static boolean checkNoCacheFile(File file) {
@@ -148,26 +118,61 @@ public class MyFileUtils {
         }
     }
 
-    public static String calculateHash(String filePath) throws IOException {
-        try (FileInputStream fis = new FileInputStream(filePath)) {
-            byte[] buffer = new byte[1024];
-            int bytesRead;
-            while ((bytesRead = fis.read(buffer)) != -1) {
-                digest.update(buffer, 0, bytesRead);
+    /**
+     * GZIP压缩，返回压缩流
+     *
+     * @param rawInput    原始输入流
+     * @param compression 压缩方式
+     * @return 压缩后的输入流
+     * @throws IOException 发生IO异常
+     */
+    public static InputStream gzipCompress(InputStream rawInput, String compression) throws IOException {
+        if (!"gzip".equalsIgnoreCase(compression)) {
+            return rawInput;
+        }
+        final PipedOutputStream pipedOut = new PipedOutputStream();
+        final PipedInputStream pipedIn = new PipedInputStream(pipedOut);
+
+        Thread.startVirtualThread(() -> {
+            try (GZIPOutputStream gzipOut = new GZIPOutputStream(pipedOut)) {
+                rawInput.transferTo(gzipOut);
+            } catch (IOException e) {
+                log.error("GZIP压缩失败: {}", e.getMessage(), e);
+            } finally {
+                try {
+                    pipedOut.close();
+                } catch (Exception ignore) {
+                }
+                try {
+                    rawInput.close();
+                } catch (Exception ignore) {
+                }
             }
-        }
-        byte[] hashBytes = digest.digest();
-        StringBuilder sb = new StringBuilder();
-        for (byte b : hashBytes) {
-            sb.append(String.format("%02x", b));
-        }
-        return sb.toString();
+        });
+
+        return pipedIn;
     }
 
-    public static boolean hashEquals(String filePath1, String filePath2) throws IOException {
-        String hash1 = calculateHash(filePath1);
-        String hash2 = calculateHash(filePath2);
-        return hash1.equals(hash2);
+    /**
+     * GZIP解压，返回解压流和字符集
+     *
+     * @param inputStream 压缩后的 inputStream
+     * @param  isGzip      是否是gzip压缩
+     * @param  charset     字符集
+     * @return 解压后的 inputStream 和字符集
+     */
+    public static Pair<InputStream, String> gzipDecompress(InputStream inputStream, boolean isGzip, String charset) {
+        charset = StrUtil.isNotBlank(charset) ? charset : CharsetUtil.UTF_8;
+        if (!isGzip) {
+            // 不是gzip压缩，直接返回原流和字符集
+            return Pair.of(inputStream, charset);
+        }
+        try {
+            return Pair.of(new GZIPInputStream(inputStream), charset);
+        } catch (IOException e) {
+            log.error("GZIP解压失败: {}", e.getMessage(), e);
+            return Pair.of(new ByteArrayInputStream(new byte[0]), charset);
+        }
     }
 }
 

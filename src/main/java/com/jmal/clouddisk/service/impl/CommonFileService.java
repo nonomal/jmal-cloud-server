@@ -1,96 +1,48 @@
 package com.jmal.clouddisk.service.impl;
 
-import cn.hutool.core.convert.Convert;
-import cn.hutool.core.date.LocalDateTimeUtil;
-import cn.hutool.core.io.CharsetDetector;
-import cn.hutool.core.io.FileUtil;
-import cn.hutool.core.io.file.PathUtil;
 import cn.hutool.core.text.CharSequenceUtil;
 import cn.hutool.core.util.BooleanUtil;
-import cn.hutool.core.util.ReUtil;
-import cn.hutool.core.util.StrUtil;
-import com.alibaba.fastjson2.JSONObject;
-import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
+import cn.hutool.json.JSONObject;
 import com.jmal.clouddisk.config.FileProperties;
-import com.jmal.clouddisk.controller.sse.Message;
-import com.jmal.clouddisk.controller.sse.SseController;
+import com.jmal.clouddisk.dao.IFileDAO;
+import com.jmal.clouddisk.dao.IShareDAO;
 import com.jmal.clouddisk.exception.CommonException;
 import com.jmal.clouddisk.exception.ExceptionType;
 import com.jmal.clouddisk.lucene.EtagService;
-import com.jmal.clouddisk.lucene.LuceneService;
-import com.jmal.clouddisk.lucene.RebuildIndexTaskService;
-import com.jmal.clouddisk.media.HeifUtils;
-import com.jmal.clouddisk.media.VideoInfo;
-import com.jmal.clouddisk.media.VideoInfoDO;
+import com.jmal.clouddisk.lucene.LuceneIndexQueueEvent;
 import com.jmal.clouddisk.media.VideoProcessService;
-import com.jmal.clouddisk.model.*;
-import com.jmal.clouddisk.model.rbac.ConsumerDO;
-import com.jmal.clouddisk.oss.OssConfigService;
+import com.jmal.clouddisk.model.OperationPermission;
+import com.jmal.clouddisk.model.ShareDO;
+import com.jmal.clouddisk.model.file.FileBase;
+import com.jmal.clouddisk.model.file.FileDocument;
+import com.jmal.clouddisk.model.file.ShareProperties;
+import com.jmal.clouddisk.model.file.dto.FileBaseDTO;
 import com.jmal.clouddisk.service.Constants;
 import com.jmal.clouddisk.service.IFileVersionService;
-import com.jmal.clouddisk.service.IUserService;
-import com.jmal.clouddisk.util.*;
+import com.jmal.clouddisk.util.FileContentTypeUtils;
+import com.jmal.clouddisk.util.MyFileUtils;
+import com.jmal.clouddisk.util.TimeUntils;
 import com.jmal.clouddisk.webdav.MyWebdavServlet;
-import com.luciad.imageio.webp.WebPWriteParam;
-import com.mongodb.client.AggregateIterable;
-import com.mongodb.client.MongoCursor;
-import com.mongodb.client.result.UpdateResult;
 import io.reactivex.rxjava3.core.Completable;
-import io.reactivex.rxjava3.core.Single;
 import io.reactivex.rxjava3.schedulers.Schedulers;
-import jakarta.validation.constraints.NotNull;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import net.coobird.thumbnailator.Thumbnails;
-import net.coobird.thumbnailator.tasks.UnsupportedFormatException;
-import org.bson.BsonNull;
-import org.bson.Document;
-import org.bson.conversions.Bson;
-import org.bson.types.ObjectId;
-import org.jetbrains.annotations.Nullable;
-import org.mozilla.universalchardet.UniversalDetector;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.mongodb.core.MongoTemplate;
-import org.springframework.data.mongodb.core.query.Criteria;
-import org.springframework.data.mongodb.core.query.Query;
-import org.springframework.data.mongodb.core.query.Update;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.core.io.InputStreamResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 
-import javax.imageio.IIOImage;
-import javax.imageio.ImageIO;
-import javax.imageio.ImageWriteParam;
-import javax.imageio.ImageWriter;
-import javax.imageio.stream.FileImageOutputStream;
-import java.awt.image.BufferedImage;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.LinkOption;
+import java.nio.charset.Charset;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.attribute.FileTime;
-import java.text.Collator;
-import java.time.Instant;
 import java.time.LocalDateTime;
-import java.util.*;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArraySet;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
-
-import static com.jmal.clouddisk.service.Constants.UPDATE_DATE;
-import static com.jmal.clouddisk.service.Constants.UPLOAD_DATE;
-import static com.jmal.clouddisk.service.IUserService.USER_ID;
-import static com.mongodb.client.model.Accumulators.sum;
-import static com.mongodb.client.model.Aggregates.group;
-import static com.mongodb.client.model.Aggregates.match;
-import static com.mongodb.client.model.Filters.and;
-import static com.mongodb.client.model.Filters.eq;
 
 /**
  * @author jmal
@@ -99,55 +51,60 @@ import static com.mongodb.client.model.Filters.eq;
  */
 @Service
 @Slf4j
+@RequiredArgsConstructor
 public class CommonFileService {
 
-    @Autowired
-    UserLoginHolder userLoginHolder;
+    private final UserLoginHolder userLoginHolder;
 
-    @Autowired
-    IUserService userService;
+    private final FileService fileService;
+
+    private final CommonUserFileService commonUserFileService;
+
+    private final MessageService messageService;
+
+    private final CommonUserService userService;
 
     public static final String COLLECTION_NAME = "fileDocument";
 
     public static final String TRASH_COLLECTION_NAME = "trash";
 
-    @Autowired
-    MongoTemplate mongoTemplate;
+    private final IFileDAO fileDAO;
 
-    @Autowired
-    FileProperties fileProperties;
+    private final IShareDAO shareDAO;
 
-    @Autowired
-    private SseController sseController;
+    private final FileProperties fileProperties;
 
-    @Autowired
-    private VideoProcessService videoProcessService;
+    private final VideoProcessService videoProcessService;
 
-    @Autowired
-    private IFileVersionService fileVersionService;
+    private final IFileVersionService fileVersionService;
 
-    @Autowired
-    public LuceneService luceneService;
+    private final ApplicationEventPublisher eventPublisher;
 
-    @Autowired
-    EtagService etagService;
-
-    private final Cache<String, Map<String, ThrottleExecutor>> throttleExecutorCache = Caffeine.newBuilder().build();
-
-    private final Cache<String, Long> userSpaceCache = Caffeine.newBuilder().expireAfterWrite(1, TimeUnit.SECONDS).build();
-
-    /**
-     * 上传文件夹的写入锁缓存
-     */
-    private final Cache<String, Lock> uploadFileLockCache = CaffeineUtil.getUploadFileLockCache();
+    private final EtagService etagService;
 
     protected static final Set<String> FILE_PATH_LOCK = new CopyOnWriteArraySet<>();
 
-    public ResponseEntity<Object> getObjectResponseEntity(FileDocument fileDocument) {
-        if (fileDocument != null) {
-            return ResponseEntity.ok().header(HttpHeaders.CONTENT_TYPE, fileDocument.getContentType()).header(HttpHeaders.CONNECTION, "close").header(HttpHeaders.CONTENT_LENGTH, String.valueOf(fileDocument.getContent() != null ? fileDocument.getContent().length : 0)).header(HttpHeaders.CONTENT_ENCODING, "utf-8").header(HttpHeaders.CACHE_CONTROL, "public, max-age=604800").body(fileDocument.getContent());
+    public ResponseEntity<InputStreamResource> getImageInputStreamResourceEntity(FileDocument fileDocument) {
+        return getInputStreamResourceEntity(fileDocument, fileDocument.getContentType());
+    }
+
+    public ResponseEntity<InputStreamResource> getInputStreamResourceEntity(FileDocument fileDocument, String contentType) {
+        if (fileDocument != null && fileDocument.getInputStream() != null) {
+            if (CharSequenceUtil.isBlank(contentType)) {
+                contentType = "application/octet-stream";
+            }
+            ResponseEntity.BodyBuilder builder = ResponseEntity.ok();
+            if (contentType.contains("svg")) {
+                if (fileDocument.getSize() != null) {
+                    builder.header(HttpHeaders.CONTENT_LENGTH, String.valueOf(fileDocument.getSize()));
+                }
+            }
+            return builder.header(HttpHeaders.CONTENT_TYPE, contentType)
+                    .header(HttpHeaders.CONNECTION, "close")
+                    .header(HttpHeaders.CACHE_CONTROL, "public, max-age=604800")
+                    .body(new InputStreamResource(fileDocument.getInputStream()));
         } else {
-            return ResponseEntity.status(HttpStatus.NOT_FOUND).body("找不到该文件");
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
         }
     }
 
@@ -168,365 +125,23 @@ public class CommonFileService {
         return currentDirectory;
     }
 
-    /***
-     * 用户磁盘目录
-     * @param upload UploadApiParamDTO
-     * @return 目录路径
-     */
-    public String getUserDirectoryFilePath(UploadApiParamDTO upload) {
-        String currentDirectory = upload.getCurrentDirectory();
-        if (CharSequenceUtil.isBlank(currentDirectory)) {
-            currentDirectory = fileProperties.getSeparator();
-        }
-        Path path;
-        if (Boolean.TRUE.equals(upload.getIsFolder())) {
-            path = Paths.get(currentDirectory, upload.getFolderPath(), upload.getFilename());
-        } else {
-            path = Paths.get(currentDirectory, upload.getRelativePath());
-        }
-        return path.toString();
+    public FileDocument getFileDocumentById(String fileId, boolean excludeContent) {
+        return fileService.getFileDocumentById(fileId, excludeContent);
     }
 
-    /**
-     * 是否存在该文件
-     *
-     * @param path      文件的相对路径
-     * @param userId    userId 用户Id
-     * @param filenames 文件名列表
-     * @return FileDocument
-     */
-    FileDocument exist(String path, String userId, List<String> filenames) {
-        Query query = new Query();
-        query.addCriteria(Criteria.where(IUserService.USER_ID).is(userId));
-        query.addCriteria(Criteria.where("path").is(path));
-        query.addCriteria(Criteria.where("name").in(filenames));
-        return mongoTemplate.findOne(query, FileDocument.class, COLLECTION_NAME);
+    public FileDocument getById(String fileId) {
+        return getById(fileId, true);
     }
 
-    /**
-     * 是否存在该文件
-     *
-     * @param path   文件的相对路径
-     * @param userId userId
-     * @param md5    md5
-     * @return FileDocument
-     */
-    FileDocument getByMd5(String path, String userId, String md5) {
-        Query query = new Query();
-        query.addCriteria(Criteria.where(IUserService.USER_ID).is(userId));
-        query.addCriteria(Criteria.where("md5").is(md5));
-        query.addCriteria(Criteria.where("path").is(path));
-        return mongoTemplate.findOne(query, FileDocument.class, COLLECTION_NAME);
+    public FileDocument getById(String fileId, boolean excludeContent) {
+        return fileService.getById(fileId, excludeContent);
     }
 
-    /**
-     * 获取文件信息
-     *
-     * @param path     文件的相对路径
-     * @param filename 文件名称
-     * @param userId   userId
-     * @return FileDocument
-     */
-    public FileDocument getFileDocumentByPath(String path, String filename, String userId) {
-        return getFileDocumentByPath(path, filename, userId, true);
+    public FileDocument getFileDocumentByOssPath(String ossPath, String pathName) {
+        return fileService.getFileDocumentByOssPath(ossPath, pathName);
     }
 
-    /**
-     * 获取文件信息
-     *
-     * @param path     文件的相对路径
-     * @param filename 文件名称
-     * @param userId   userId
-     * @return FileDocument
-     */
-    public FileDocument getFileDocumentByPath(String path, String filename, String userId, boolean excludeContent) {
-        Query query = getQuery(path, filename, userId);
-        if (excludeContent) {
-            query.fields().exclude("content");
-        }
-        query.fields().exclude("contentText");
-        return mongoTemplate.findOne(query, FileDocument.class, COLLECTION_NAME);
-    }
-
-    public static Query getQuery(FileDocument fileDocument) {
-        return getQuery(fileDocument.getPath(), fileDocument.getName(), fileDocument.getUserId());
-    }
-
-    public static Query getQuery(String path, String name, String userId) {
-        Query query = new Query();
-        query.addCriteria(Criteria.where(IUserService.USER_ID).is(userId));
-        query.addCriteria(Criteria.where("name").is(name));
-        query.addCriteria(Criteria.where("path").is(path));
-        return query;
-    }
-
-    /**
-     * 获取文件路径(含用户名)获取文件信息
-     *
-     * @param filepath 文件的相对路径(以username开头)
-     * @param userId   userId
-     * @return FileDocument
-     */
-    public FileDocument getFileDocumentByPath(String filepath, String userId) {
-        Path relativePath = Paths.get(filepath);
-        String filename = relativePath.getFileName().toString();
-        String path = File.separator;
-        if (relativePath.getNameCount() > 2) {
-            path += relativePath.subpath(1, relativePath.getNameCount() - 1) + File.separator;
-        }
-        return getFileDocumentByPath(path, filename, userId);
-    }
-
-    /***
-     * 如果文件夹不存在，则创建
-     * @param docPaths  文件夹path
-     * @param username username
-     * @param userId userId
-     */
-    public void upsertFolder(@NotNull Path docPaths, @NotNull String username, @NotNull String userId) {
-        File dir = Paths.get(fileProperties.getRootDir(), username, docPaths.toString()).toFile();
-        if (!dir.exists()) {
-            StringBuilder parentPath = new StringBuilder();
-            for (int i = 0; i < docPaths.getNameCount(); i++) {
-                String name = docPaths.getName(i).toString();
-                UploadApiParamDTO uploadApiParamDTO = new UploadApiParamDTO();
-                uploadApiParamDTO.setIsFolder(true);
-                uploadApiParamDTO.setFilename(name);
-                uploadApiParamDTO.setUsername(username);
-                uploadApiParamDTO.setUserId(userId);
-                if (i > 0) {
-                    uploadApiParamDTO.setCurrentDirectory(parentPath.toString());
-                }
-                createFolder(uploadApiParamDTO);
-                parentPath.append("/").append(name);
-            }
-        }
-    }
-
-    public void createFolder(UploadApiParamDTO upload) {
-        // 新建文件夹
-        String userDirectoryFilePath = getUserDirectoryFilePath(upload);
-        //没有分片,直接存
-        File dir = new File(fileProperties.getRootDir() + File.separator + upload.getUsername() + userDirectoryFilePath);
-        if (!dir.exists()) {
-            FileUtil.mkdir(dir);
-        }
-        // 保存文件夹信息
-        createFile(upload.getUsername(), dir, null, null);
-    }
-
-    /***
-     * 创建文件索引
-     * @param username 用户名
-     * @param file File
-     * @param userId 用户Id
-     * @param isPublic 是否为公共文件
-     * @return fileId
-     */
-    public String createFile(String username, File file, String userId, Boolean isPublic) {
-        if (CaffeineUtil.hasUploadFileCache(file.getAbsolutePath())) {
-            return null;
-        }
-        if (CharSequenceUtil.isBlank(username)) {
-            return null;
-        }
-        if (CharSequenceUtil.isBlank(userId)) {
-            userId = userService.getUserIdByUserName(username);
-            if (CharSequenceUtil.isBlank(userId)) {
-                return null;
-            }
-        }
-        String fileName = file.getName();
-        String suffix = MyFileUtils.extName(fileName);
-        String contentType = getContentType(file, FileContentTypeUtils.getContentType(file, suffix));
-        if (contentType.startsWith(Constants.CONTENT_TYPE_IMAGE)) {
-            // 换成webp格式的图片
-            file = replaceWebp(userId, file, username);
-            if (file == null) {
-                return null;
-            }
-        }
-
-        String fileAbsolutePath = file.getAbsolutePath();
-        Lock lock = uploadFileLockCache.get(fileAbsolutePath, key -> new ReentrantLock());
-        if (lock != null) {
-            lock.lock();
-        }
-        UpdateResult updateResult = null;
-        ObjectId objectId = new ObjectId();
-        String fileId = objectId.toHexString();
-        try {
-            String relativePath = getRelativePath(username, fileAbsolutePath, fileName);
-            if (relativePath == null) return null;
-            Query query = new Query();
-            FileDocument fileExists = getFileDocument(userId, fileName, relativePath, query);
-            if (fileExists != null) {
-                // 添加文件索引
-                // 获取tagName
-                Update update = new Update();
-                updateExifInfo(file, fileExists, contentType, suffix, update);
-                updateVideoInfo(file, fileExists, contentType, update);
-                updateOtherInfo(fileExists, contentType, suffix, update);
-                updateLastModifiedTime(file, fileExists, update);
-                if (!update.getUpdateObject().isEmpty()) {
-                    mongoTemplate.updateFirst(query, update, COLLECTION_NAME);
-                }
-                luceneService.pushCreateIndexQueue(fileExists.getId());
-                return fileExists.getId();
-            }
-            Update update = new Update();
-            // 设置创建时间和修改时间
-            update.set(UPLOAD_DATE, LocalDateTime.now(TimeUntils.ZONE_ID));
-            update.set(UPDATE_DATE, getFileLastModifiedTime(file));
-            update.set("_id", objectId);
-            update.set(IUserService.USER_ID, userId);
-            update.set("name", fileName);
-            update.set("path", relativePath);
-            update.set(Constants.IS_FOLDER, file.isDirectory());
-            update.set(Constants.IS_FAVORITE, false);
-            if (isPublic != null) {
-                update.set("isPublic", true);
-            }
-            if (file.isFile()) {
-                setFileConfig(fileId, username, file, fileName, suffix, contentType, relativePath, update);
-            } else {
-                // 检查目录是否为OSS目录
-                checkOSSPath(username, relativePath, fileName, update);
-            }
-            // 检查该文件的上级目录是否有已经分享的目录
-            checkShareBase(update, relativePath);
-            updateResult = mongoTemplate.upsert(query, update, COLLECTION_NAME);
-            pushMessage(username, update.getUpdateObject(), Constants.CREATE_FILE);
-            // 添加文件索引
-            luceneService.pushCreateIndexQueue(fileId);
-            if (file.isDirectory()) {
-                etagService.handleNewFolderCreationAsync(username, file);
-            }
-        } catch (Exception e) {
-            log.error("{} file: {}", e.getMessage(), file.getAbsoluteFile(), e);
-        } finally {
-            if (lock != null) {
-                lock.unlock();
-                uploadFileLockCache.invalidate(fileAbsolutePath);
-            }
-        }
-        if (updateResult != null && null != updateResult.getUpsertedId()) {
-            return updateResult.getUpsertedId().asObjectId().getValue().toHexString();
-        }
-        return fileId;
-    }
-
-    /**
-     * 统计文件夹的大小
-     */
-    public long getFolderSize(String collectionName, String userId, String path) {
-        return etagService.getFolderSize(collectionName, userId, path);
-    }
-
-    /**
-     * 修改文件的最后修改时间
-     *
-     * @param file       文件
-     * @param fileExists FileDocument
-     * @param update     Update
-     */
-    private void updateLastModifiedTime(File file, FileDocument fileExists, Update update) {
-        LocalDateTime lastModifiedTime = getFileLastModifiedTime(file);
-        // 判断 fileExists.getUpdateDate() 和 lastModifiedTime是否在1ms内
-        if (fileExists.getUpdateDate() != null && lastModifiedTime.isEqual(fileExists.getUpdateDate())) {
-            update.set(UPDATE_DATE, lastModifiedTime);
-        }
-    }
-
-    /**
-     * 设置文件的最后修改时间
-     *
-     * @param filePath     文件路径
-     * @param lastModified 最后修改时间
-     * @throws IOException IO异常
-     */
-    public static void setLastModifiedTime(Path filePath, Long lastModified) throws IOException {
-        if (lastModified == null) {
-            return;
-        }
-        Instant instant = Instant.ofEpochMilli(lastModified);
-        FileTime fileTime = FileTime.from(instant);
-        Files.setLastModifiedTime(filePath, fileTime);
-    }
-
-    private void updateOtherInfo(FileDocument fileExists, String contentType, String suffix, Update update) {
-        if (!contentType.equals(fileExists.getContentType())) {
-            update.set(Constants.CONTENT_TYPE, contentType);
-        }
-        if (CharSequenceUtil.isNotBlank(suffix) && !suffix.equals(fileExists.getSuffix())) {
-            update.set(Constants.SUFFIX, suffix);
-        }
-    }
-
-    public String getRelativePath(String username, String fileAbsolutePath, String fileName) {
-        int startIndex = fileProperties.getRootDir().length() + username.length() + 1;
-        int endIndex = fileAbsolutePath.length() - fileName.length();
-        if (startIndex >= endIndex) {
-            return null;
-        }
-        return fileAbsolutePath.substring(startIndex, endIndex);
-    }
-
-    /**
-     * 更新文档的Exif信息
-     *
-     * @param file        文件
-     * @param fileExists  文件信息
-     * @param contentType 文件类型
-     * @param suffix      文件后缀
-     */
-    private void updateExifInfo(File file, FileDocument fileExists, String contentType, String suffix, Update update) {
-        if (!ImageExifUtil.isImageType(contentType, suffix)) {
-            return;
-        }
-        if (fileExists.getExif() == null || RebuildIndexTaskService.isSyncFile()) {
-            // 更新图片Exif信息
-            update.set("exif", ImageExifUtil.getExif(file));
-        }
-    }
-
-    private void updateVideoInfo(File file, FileDocument fileExists, String contentType, Update update) {
-        if (!contentType.contains(Constants.VIDEO)) {
-            return;
-        }
-        if (fileExists.getVideo() == null || RebuildIndexTaskService.isSyncFile()) {
-            VideoInfo videoInfo = videoProcessService.getVideoInfo(file);
-            VideoInfoDO videoInfoDO = videoInfo.toVideoInfoDO();
-            update.set("video.bitrate", videoInfoDO.getBitrate());
-            update.set("video.bitrateNum", videoInfoDO.getBitrateNum());
-            update.set("video.format", videoInfoDO.getFormat());
-            update.set("video.duration", videoInfoDO.getDuration());
-            update.set("video.durationNum", videoInfoDO.getDurationNum());
-            update.set("video.width", videoInfoDO.getWidth());
-            update.set("video.height", videoInfoDO.getHeight());
-            update.set("video.frameRate", videoInfoDO.getFrameRate());
-        }
-    }
-
-    public static LocalDateTime getFileLastModifiedTime(File file) {
-        try {
-            Map<String, Object> attributes = Files.readAttributes(file.toPath(), "lastModifiedTime,creationTime", LinkOption.NOFOLLOW_LINKS);
-            FileTime lastModifiedTime = (FileTime) attributes.get("lastModifiedTime");
-            return LocalDateTimeUtil.of(lastModifiedTime.toInstant());
-        } catch (IOException e) {
-            return LocalDateTime.now(TimeUntils.ZONE_ID);
-        }
-    }
-
-    public FileDocument getFileDocument(String userId, String fileName, String relativePath, Query query) {
-        query.addCriteria(Criteria.where(IUserService.USER_ID).is(userId));
-        query.addCriteria(Criteria.where("path").is(relativePath));
-        query.addCriteria(Criteria.where("name").is(fileName));
-        // 文件是否存在
-        return mongoTemplate.findOne(query, FileDocument.class, COLLECTION_NAME);
-    }
-
-    public FileDocument getFileDocument(String username, String fileAbsolutePath, Query query) {
+    public FileBaseDTO getFileBaseDTO(String username, String fileAbsolutePath) {
         String userId = userService.getUserIdByUserName(username);
         if (CharSequenceUtil.isBlank(userId)) {
             return null;
@@ -537,123 +152,17 @@ public class CommonFileService {
         }
         String fileName = file.getName();
         String relativePath = fileAbsolutePath.substring(fileProperties.getRootDir().length() + username.length() + 1, fileAbsolutePath.length() - fileName.length());
-        return getFileDocument(userId, fileName, relativePath, query);
-    }
-
-    public FileDocument getFileDocument(String userId, String fileName, String relativePath) {
-        Query query = new Query();
-        // 文件是否存在
-        return getFileDocument(userId, fileName, relativePath, query);
-    }
-
-    private File replaceWebp(String userId, File file, String username) {
-        String suffix = FileUtil.getSuffix(file).toLowerCase();
-        // 判断是否为heic格式
-        if ("heic".equals(suffix)) {
-            String output = HeifUtils.heifConvert(file.getAbsolutePath(), Paths.get(fileProperties.getRootDir(), fileProperties.getChunkFileDir(), username));
-            if (output != null) {
-                FileUtil.del(file);
-                return null;
-            }
-        }
-
-        if (userService.getDisabledWebp(userId) || ("ico".equals(suffix))) {
-            return file;
-        }
-        if (Constants.SUFFIX_WEBP.equals(suffix)) {
-            return file;
-        }
-        File outputFile = new File(file.getPath() + Constants.POINT_SUFFIX_WEBP);
-        // 从某处获取图像进行编码
-        BufferedImage image;
-        try {
-            image = ImageIO.read(file);
-            if (image == null) {
-                return file;
-            }
-            imageFileToWebp(outputFile, image);
-            FileUtil.del(file);
-        } catch (IOException e) {
-            log.error(e.getMessage(), e);
-            return file;
-        }
-        return outputFile;
-    }
-
-    public void imageFileToWebp(File outputFile, BufferedImage image) throws IOException {
-        // 获取一个WebP ImageWriter实例
-        ImageWriter writer = ImageIO.getImageWritersByMIMEType(Constants.CONTENT_TYPE_WEBP).next();
-        // 配置编码参数
-        WebPWriteParam writeParam = new WebPWriteParam(writer.getLocale());
-        writeParam.setCompressionMode(ImageWriteParam.MODE_DEFAULT);
-        // 在ImageWriter上配置输出
-        writer.setOutput(new FileImageOutputStream(outputFile));
-        // 编码
-        writer.write(null, new IIOImage(image, null, null), writeParam);
-    }
-
-    private void setFileConfig(String fileId, String username, File file, String fileName, String suffix, String contentType, String relativePath, Update update) {
-        try {
-            long size = file.length();
-            update.set("size", size);
-            update.set("md5", size + relativePath + fileName);
-            update.set(Constants.CONTENT_TYPE, contentType);
-            update.set(Constants.SUFFIX, suffix);
-            if (contentType.contains(Constants.AUDIO)) {
-                setMusic(file, update);
-            }
-            if (contentType.contains(Constants.VIDEO)) {
-                setMediaCover(fileId, username, fileName, relativePath, update);
-            }
-            if (ImageExifUtil.isImageType(contentType, suffix)) {
-                // 处理图片
-                processImage(file, update);
-            }
-            if (contentType.contains(Constants.CONTENT_TYPE_MARK_DOWN) || "md".equals(suffix)) {
-                // 写入markdown内容
-                String markDownContent = FileUtil.readString(file, MyFileUtils.getFileCharset(file));
-                update.set("contentText", markDownContent);
-            }
-        } catch (Exception e) {
-            log.error(e.getMessage(), e);
-        }
-    }
-
-    private void processImage(File file, Update update) {
-        // 获取图片尺寸
-        FastImageInfo imageInfo = new FastImageInfo(file);
-        if (imageInfo.getWidth() > 0 && imageInfo.getHeight() > 0) {
-            update.set("w", imageInfo.getWidth());
-            update.set("h", imageInfo.getHeight());
-        }
-        // 获取图片Exif信息
-        update.set("exif", ImageExifUtil.getExif(file));
-        // 生成缩略图
-        generateThumbnail(file, update);
+        return new FileBaseDTO(fileName, relativePath, userId);
     }
 
     public static String getContentType(File file, String contentType) {
         try {
-            if (MyFileUtils.hasCharset(file)) {
-                String charset = UniversalDetector.detectCharset(file);
-                if (StrUtil.isNotBlank(charset)) {
-                    if (StandardCharsets.UTF_8.name().equals(charset)) {
-                        if (FileContentTypeUtils.DEFAULT_CONTENT_TYPE.equals(contentType)) {
-                            contentType = "text/plan;charset=utf-8";
-                        } else {
-                            contentType = contentType + ";charset=utf-8";
-                        }
-                    } else {
-                        if (file.length() < FileContentTypeUtils.MAX_DETECT_FILE_SIZE && CharsetDetector.detect(file).equals(StandardCharsets.UTF_8)) {
-                            if (FileContentTypeUtils.DEFAULT_CONTENT_TYPE.equals(contentType)) {
-                                contentType = "text/plan;charset=utf-8";
-                            } else {
-                                contentType = contentType + ";charset=utf-8";
-                            }
-                        } else {
-                            contentType = contentType + ";charset=" + charset;
-                        }
-                    }
+            Charset charset = MyFileUtils.getCharset(file);
+            if (charset != null) {
+                if (FileContentTypeUtils.DEFAULT_CONTENT_TYPE.equals(contentType)) {
+                    contentType = "text/plan;charset=utf-8";
+                } else {
+                    contentType = contentType + ";charset=utf-8";
                 }
             }
         } catch (Exception e) {
@@ -662,343 +171,46 @@ public class CommonFileService {
         return contentType;
     }
 
-    private static void setMusic(File file, Update update) {
-        Music music = AudioFileUtils.readAudio(file);
-        if (update == null) {
-            update = new Update();
-        }
-        update.set("music", music);
-    }
-
-    private void setMediaCover(String fileId, String username, String fileName, String relativePath, Update update) {
-        VideoInfo videoInfo = videoProcessService.getVideoCover(fileId, username, relativePath, fileName);
-        String coverPath = videoInfo.getCovertPath();
-        log.debug("\r\ncoverPath:{}", coverPath);
-        if (!CharSequenceUtil.isBlank(coverPath)) {
-            if (update == null) {
-                update = new Update();
-            }
-            update.set("content", PathUtil.readBytes(Paths.get(coverPath)));
-            update.set("video", videoInfo.toVideoInfoDO());
-            videoProcessService.convertToM3U8(fileId);
-            update.set("mediaCover", true);
-            FileUtil.del(coverPath);
-        } else {
-            update.set("mediaCover", false);
-        }
-    }
-
-    /**
-     * 生成缩略图
-     *
-     * @param file   File
-     * @param update org.springframework.data.mongodb.core.query.UpdateDefinition
-     */
-    private void generateThumbnail(File file, Update update) {
-        try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            Thumbnails.Builder<? extends File> thumbnail = Thumbnails.of(file);
-            thumbnail.size(256, 256);
-            thumbnail.toOutputStream(out);
-            update.set("content", out.toByteArray());
-        } catch (UnsupportedFormatException e) {
-            log.warn("{}{}", e.getMessage(), file.getAbsolutePath());
-        } catch (Exception e) {
-            log.error("{}{}", e.getMessage(), file.getAbsolutePath());
-        } catch (Throwable e) {
-            log.error(e.getMessage());
-        }
-    }
-
-    public void pushMessage(String username, Object message, String url) {
-        Completable.fromAction(() -> pushMessageSync(username, message, url)).subscribeOn(Schedulers.io()).subscribe();
-    }
-
-    /**
-     * 给用户推送消息
-     *
-     * @param username username
-     * @param message  message
-     * @param url      url
-     */
-    public void pushMessageSync(String username, Object message, String url) {
-        if (timelyPush(username, message, url)) return;
-        if (Constants.CREATE_FILE.equals(url) || Constants.DELETE_FILE.equals(url)) {
-            Map<String, ThrottleExecutor> throttleExecutorMap = throttleExecutorCache.get(username, key -> new HashMap<>(8));
-            if (throttleExecutorMap != null) {
-                ThrottleExecutor throttleExecutor = throttleExecutorMap.get(url);
-                if (throttleExecutor == null) {
-                    throttleExecutor = new ThrottleExecutor(300);
-                    throttleExecutorMap.put(url, throttleExecutor);
-                }
-                throttleExecutor.schedule(() -> pushMsg(username, message, url));
-            }
-        } else {
-            pushMsg(username, message, url);
-        }
-    }
-
-    private boolean timelyPush(String username, Object message, String url) {
-        if (Constants.CREATE_FILE.equals(url)) {
-            if (message instanceof Document setDoc) {
-                Object set = setDoc.get("$set");
-                if (set instanceof Document doc) {
-                    doc.remove("content");
-                    Boolean isFolder = doc.getBoolean(Constants.IS_FOLDER);
-                    if (Boolean.TRUE.equals(isFolder)) {
-                        pushMsg(username, message, url);
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
-    }
-
-    private void pushMsg(String username, Object message, String url) {
-        Message msg = new Message();
-        String userId = userLoginHolder.getUserId();
-        if (CharSequenceUtil.isBlank(userId)) {
-            userId = userService.getUserIdByUserName(username);
-        }
-        if (!CharSequenceUtil.isBlank(userId)) {
-            long takeUpSpace = occupiedSpace(userId);
-            msg.setSpace(takeUpSpace);
-        }
-        if (message == null) {
-            message = new Document();
-        }
-        if (message instanceof FileDocument fileDocument) {
-            fileDocument.setContent(null);
-            fileDocument.setMusic(null);
-            fileDocument.setContentText(null);
-        }
-        msg.setUrl(url);
-        msg.setUsername(username);
-        msg.setBody(message);
-        sseController.sendEvent(msg);
-    }
-
     public void pushMessageOperationFileError(String username, String message, String operation) {
         JSONObject msg = new JSONObject();
-        msg.put("code", -1);
-        msg.put("msg", message);
-        msg.put("operation", operation);
-        pushMessage(username, msg, Constants.OPERATION_FILE);
+        msg.set("code", -1);
+        msg.set("msg", message);
+        msg.set("operation", operation);
+        messageService.pushMessage(username, msg, Constants.OPERATION_FILE);
     }
 
     public void pushMessageOperationFileSuccess(String fromPath, String toPath, String username, String operation) {
         JSONObject msg = new JSONObject();
-        msg.put("code", 0);
-        msg.put("from", fromPath);
-        msg.put("to", toPath);
-        msg.put("operation", operation);
-        pushMessage(username, msg, Constants.OPERATION_FILE);
-    }
-
-    public long occupiedSpace(String userId) {
-        Long space = userSpaceCache.get(userId, key -> calculateTotalOccupiedSpace(userId).blockingGet());
-        if (space == null) {
-            space = 0L;
-        }
-        ConsumerDO consumerDO = userService.userInfoById(userId);
-        if (consumerDO != null && consumerDO.getQuota() != null) {
-            if (space >= consumerDO.getQuota() * 1024L * 1024L * 1024L) {
-                // 空间已满
-                CaffeineUtil.setSpaceFull(userId);
-            } else {
-                if (CaffeineUtil.spaceFull(userId)) {
-                    CaffeineUtil.removeSpaceFull(userId);
-                }
-            }
-        }
-        return space;
-    }
-
-    public Single<Long> calculateTotalOccupiedSpace(String userId) {
-        Single<Long> space1Single = getOccupiedSpaceAsync(userId, COLLECTION_NAME);
-        Single<Long> space2Single = getOccupiedSpaceAsync(userId, TRASH_COLLECTION_NAME);
-        return Single.zip(space1Single, space2Single, Long::sum);
-    }
-
-    public Single<Long> getOccupiedSpaceAsync(String userId, String collectionName) {
-        return Single.fromCallable(() -> getOccupiedSpace(userId, collectionName)).subscribeOn(Schedulers.io()).doOnError(e -> log.error(e.getMessage(), e));
-    }
-
-    public long getOccupiedSpace(String userId, String collectionName) {
-        Long space = 0L;
-        List<Bson> list = Arrays.asList(match(and(eq(IUserService.USER_ID, userId), eq(Constants.IS_FOLDER, false))), group(new BsonNull(), sum(Constants.TOTAL_SIZE, "$size")));
-        AggregateIterable<Document> aggregateIterable = mongoTemplate.getCollection(collectionName).aggregate(list);
-        Document doc = aggregateIterable.first();
-        if (doc != null) {
-            space = Convert.toLong(doc.get(Constants.TOTAL_SIZE), 0L);
-        }
-        return space;
-    }
-
-    /**
-     * 检查目录是否为OSS目录
-     *
-     * @param username     username
-     * @param relativePath relativePath
-     * @param fileName     fileName
-     * @param update       Update
-     */
-    private static void checkOSSPath(String username, String relativePath, String fileName, Update update) {
-        if (!MyWebdavServlet.PATH_DELIMITER.equals(relativePath)) {
-            return;
-        }
-        Path prePath = Paths.get(username, relativePath, fileName);
-        String ossPath = CaffeineUtil.getOssPath(prePath);
-        if (ossPath != null) {
-            update.set("ossFolder", CaffeineUtil.getOssDiameterPrefixCache(ossPath).getFolderName());
-            update.set("ossPlatform", OssConfigService.getOssStorageService(ossPath).getPlatform().getValue());
-        }
-    }
-
-    public void checkShareBase(Update update, String relativePath) {
-        Document shareDocument = getShareBaseDocument(relativePath);
-        if (shareDocument == null) {
-            return;
-        }
-        Long expiresAt = Convert.toLong(shareDocument.get(Constants.EXPIRES_AT), null);
-        if (expiresAt == null) {
-            return;
-        }
-        String shareId = Convert.toStr(shareDocument.get(Constants.SHARE_ID), null);
-        if (shareId == null) {
-            return;
-        }
-        Boolean isPrivacy = Convert.toBool(shareDocument.get(Constants.IS_PRIVACY), null);
-        if (isPrivacy == null) {
-            return;
-        }
-        String extractionCode = Convert.toStr(shareDocument.get(Constants.EXTRACTION_CODE), null);
-        if (isPrivacy && extractionCode == null) {
-            return;
-        }
-        List<OperationPermission> operationPermissionList = new ArrayList<>();
-        if (shareDocument.get(Constants.OPERATION_PERMISSION_LIST) != null) {
-            operationPermissionList = Convert.toList(OperationPermission.class, shareDocument.get(Constants.OPERATION_PERMISSION_LIST));
-        }
-        setShareAttribute(update, expiresAt, shareId, isPrivacy, extractionCode, operationPermissionList);
-    }
-
-    @Nullable
-    public Document getShareBaseDocument(String relativePath) {
-        if (CharSequenceUtil.isBlank(relativePath)) {
-            return null;
-        }
-        Path path = Paths.get(relativePath);
-        StringBuilder pathStr = new StringBuilder("/");
-        List<Document> documentList = new ArrayList<>(path.getNameCount());
-        for (int i = 0; i < path.getNameCount(); i++) {
-            String filename = path.getName(i).toString();
-            if (i > 0) {
-                pathStr.append("/");
-            }
-            Document document = new Document("path", pathStr.toString()).append("name", filename);
-            documentList.add(document);
-            pathStr.append(filename);
-        }
-        if (documentList.isEmpty()) {
-            return null;
-        }
-        List<Document> list = Arrays.asList(new Document("$match", new Document("$or", documentList)), new Document("$match", new Document(Constants.SHARE_BASE, true)));
-        AggregateIterable<Document> result = mongoTemplate.getCollection(COLLECTION_NAME).aggregate(list);
-        Document shareDocument = null;
-        try (MongoCursor<Document> mongoCursor = result.iterator()) {
-            while (mongoCursor.hasNext()) {
-                shareDocument = mongoCursor.next();
-            }
-        }
-        return shareDocument;
+        msg.set("code", 0);
+        msg.set("from", fromPath);
+        msg.set("to", toPath);
+        msg.set("operation", operation);
+        messageService.pushMessage(username, msg, Constants.OPERATION_FILE);
     }
 
     /***
      * 设置共享属性
      * @param fileDocument FileDocument
      * @param expiresAt 过期时间
-     * @param query 查询条件
+     * @param share ShareDO
+     * @param isFolder 是否是文件夹
      */
-    void setShareAttribute(FileDocument fileDocument, long expiresAt, ShareDO share, Query query) {
-        Update update = new Update();
-        setShareAttribute(update, expiresAt, share.getId(), share.getIsPrivacy(), share.getExtractionCode(), share.getOperationPermissionList());
-        mongoTemplate.updateMulti(query, update, COLLECTION_NAME);
+    void setShareAttribute(FileDocument fileDocument, long expiresAt, ShareDO share, boolean isFolder) {
+        ShareProperties shareProperties = new ShareProperties(share.getIsPrivacy(), share.getExtractionCode(), expiresAt, share.getOperationPermissionList(), true);
+        fileDAO.updateShareProps(fileDocument, share.getId(), shareProperties, isFolder);
         // 修改第一个文件/文件夹
-        updateShareFirst(fileDocument, update, true);
-    }
-
-    private void updateShareFirst(FileDocument fileDocument, Update update, boolean share) {
-        if (share) {
-            update.set(Constants.SHARE_BASE, true);
-        } else {
-            update.unset(Constants.SHARE_BASE);
-        }
-        Query query1 = new Query();
-        query1.addCriteria(Criteria.where("_id").is(fileDocument.getId()));
-        mongoTemplate.updateFirst(query1, update, COLLECTION_NAME);
-    }
-
-    /**
-     * 设置共享属性
-     *
-     * @param expiresAt      过期时间
-     * @param shareId        shareId
-     * @param isPrivacy      isPrivacy
-     * @param extractionCode extractionCode
-     */
-    private static void setShareAttribute(Update update, long expiresAt, String shareId, Boolean isPrivacy, String extractionCode, List<OperationPermission> operationPermissionListList) {
-        update.set(Constants.IS_SHARE, true);
-        update.set(Constants.SHARE_ID, shareId);
-        update.set(Constants.EXPIRES_AT, expiresAt);
-        update.set(Constants.IS_PRIVACY, isPrivacy);
-        if (operationPermissionListList != null) {
-            update.set(Constants.OPERATION_PERMISSION_LIST, operationPermissionListList);
-        }
-        if (BooleanUtil.isTrue(isPrivacy)) {
-            update.set(Constants.EXTRACTION_CODE, extractionCode);
-        } else {
-            update.unset(Constants.EXTRACTION_CODE);
-        }
-    }
-
-    /**
-     * 通过文件的绝对路径获取用户名
-     *
-     * @param absolutePath 绝对路径
-     * @return 用户名
-     */
-    public String getUsernameByAbsolutePath(Path absolutePath) {
-        if (absolutePath == null) {
-            return null;
-        }
-        Path parentPath = Paths.get(fileProperties.getRootDir());
-        if (absolutePath.startsWith(parentPath)) {
-            Path relativePath = parentPath.relativize(absolutePath);
-            if (relativePath.getNameCount() > 1) {
-                return relativePath.getName(0).toString();
-            }
-        }
-        return null;
+        fileDAO.updateShareFirst(fileDocument.getId(), share.getId(), shareProperties, true);
     }
 
     /***
      * 解除共享属性
      * @param fileDocument FileDocument
-     * @param query 查询条件
+     * @param isFolder 是否是文件夹
      */
-    void unsetShareAttribute(FileDocument fileDocument, Query query) {
-        Update update = new Update();
-        update.unset(Constants.SHARE_ID);
-        update.unset(Constants.IS_SHARE);
-        update.unset(Constants.SUB_SHARE);
-        update.unset(Constants.EXPIRES_AT);
-        update.unset(Constants.IS_PRIVACY);
-        update.unset(Constants.OPERATION_PERMISSION_LIST);
-        update.unset(Constants.EXTRACTION_CODE);
-        mongoTemplate.updateMulti(query, update, COLLECTION_NAME);
+    void unsetShareAttribute(FileDocument fileDocument, boolean isFolder) {
+        fileDAO.unsetShareProps(fileDocument, isFolder);
         // 修改第一个文件/文件夹
-        updateShareFirst(fileDocument, update, false);
+        fileDAO.updateShareFirst(fileDocument.getId(), null, null, false);
     }
 
     public void checkPermissionUsername(String username, String currentUsername, List<OperationPermission> operationPermissionList, OperationPermission operationPermission) {
@@ -1023,26 +235,24 @@ public class CommonFileService {
         return operationPermissionList == null || !operationPermissionList.contains(operationPermission);
     }
 
-    public void deleteDependencies(String username, List<String> fileIds, boolean sweep) {
-        if (sweep) {
-            // delete history version
-            fileVersionService.deleteAll(fileIds);
-            // delete video cache
-            videoProcessService.deleteVideoCacheByIds(username, fileIds);
-        }
-        // delete share
-        Query shareQuery = new Query();
-        shareQuery.addCriteria(Criteria.where(Constants.FILE_ID).in(fileIds));
-        mongoTemplate.remove(shareQuery, ShareDO.class);
-        // delete index
-        luceneService.deleteIndexDocuments(fileIds);
+    public void deleteDependencies(String username, List<String> fileIds) {
+        Completable.fromAction(() -> syncDeleteDependencies(username, fileIds)).subscribeOn(Schedulers.io())
+                .doOnError(e -> log.error(e.getMessage(), e))
+                .onErrorComplete()
+                .subscribe();
     }
 
-    public Query getAllByFolderQuery(FileDocument fileDocument) {
-        Query query1 = new Query();
-        query1.addCriteria(Criteria.where(USER_ID).is(fileDocument.getUserId()));
-        query1.addCriteria(Criteria.where("path").regex("^" + ReUtil.escape(fileDocument.getPath() + fileDocument.getName() + "/")));
-        return query1;
+    public void syncDeleteDependencies(String username, List<String> fileIds) {
+        // delete mount file
+        fileDAO.removeByMountFileIdIn(fileIds);
+        // delete history version
+        fileVersionService.deleteAll(fileIds);
+        // delete video cache
+        videoProcessService.deleteVideoCacheByIds(username, fileIds);
+        // delete share
+        shareDAO.removeByFileIdIn(fileIds);
+        // delete index
+        eventPublisher.publishEvent(new LuceneIndexQueueEvent(this, fileIds));
     }
 
     public void deleteFile(String username, File file) {
@@ -1053,19 +263,20 @@ public class CommonFileService {
         if (CharSequenceUtil.isBlank(userId)) {
             return;
         }
-        Query query = new Query();
         // 文件是否存在
-        FileDocument fileDocument = getFileDocument(userId, fileName, relativePath, query);
-        if (fileDocument != null) {
-            deleteDependencies(username, Collections.singletonList(fileDocument.getId()), false);
-            mongoTemplate.remove(query, COLLECTION_NAME);
-            if (BooleanUtil.isTrue(fileDocument.getIsFolder())) {
+        FileBaseDTO fileBaseDTO = fileDAO.findFileBaseDTOByUserIdAndPathAndName(userId, relativePath, fileName);
+        if (fileBaseDTO != null) {
+            deleteDependencies(username, Collections.singletonList(fileBaseDTO.getId()));
+            fileDAO.removeByUserIdAndPathAndName(userId, relativePath, fileName);
+            if (BooleanUtil.isTrue(fileBaseDTO.getIsFolder())) {
                 // 删除文件夹及其下的所有文件
-                mongoTemplate.remove(getAllByFolderQuery(fileDocument), FileDocument.class);
-                luceneService.deleteIndexDocuments(Collections.singletonList(fileDocument.getId()));
+                fileDAO.removeAllByFolder(fileBaseDTO);
+                eventPublisher.publishEvent(new LuceneIndexQueueEvent(this, Collections.singletonList(fileBaseDTO.getId())));
             }
         }
-        pushMessage(username, relativePath, Constants.DELETE_FILE);
+        // update parent folder etag
+        etagService.handleItemDeletionAsync(username, file);
+        messageService.pushMessage(username, relativePath, Constants.DELETE_FILE);
     }
 
     public void modifyFile(String username, File file) {
@@ -1080,86 +291,34 @@ public class CommonFileService {
         if (CharSequenceUtil.isBlank(userId)) {
             return;
         }
-        Query query = new Query();
         // 文件是否存在
-        FileDocument fileDocument = getFileDocument(userId, fileName, relativePath, query);
-
+        FileDocument fileDocument = fileDAO.findByUserIdAndPathAndName(userId, relativePath, fileName);
         String suffix = MyFileUtils.extName(file.getName());
         String contentType = FileContentTypeUtils.getContentType(file, suffix);
         // 文件是否存在
         if (fileDocument != null) {
-            Update update = new Update();
-            update.set("size", file.length());
-            update.set("md5", file.length() + "/" + fileDocument.getName());
-            update.set(Constants.SUFFIX, suffix);
-            String fileContentType = getContentType(file, contentType);
-            update.set(Constants.CONTENT_TYPE, fileContentType);
-            LocalDateTime updateTime = getFileLastModifiedTime(file);
-            update.set(UPDATE_DATE, updateTime);
+            LocalDateTime updateTime = CommonUserFileService.getFileLastModifiedTime(file);
             // 如果size相同，不更新,且更新时间在1秒内,则不更新
             if (TimeUntils.isWithinOneSecond(fileDocument.getUpdateDate(), updateTime)) {
                 return;
             }
-            UpdateResult updateResult = mongoTemplate.upsert(query, update, COLLECTION_NAME);
+            String fileContentType = getContentType(file, contentType);
+            String md5 = file.length() + "/" + fileDocument.getName();
+            long modifiedCount = fileDAO.updateModifyFile(fileDocument.getId(), file.length(), md5, suffix, fileContentType, updateTime);
             fileDocument.setSize(file.length());
             fileDocument.setUpdateDate(updateTime);
-            if (contentType.contains(Constants.CONTENT_TYPE_MARK_DOWN) || "md".equals(suffix)) {
-                // 写入markdown内容
-                String markDownContent = FileUtil.readString(file, MyFileUtils.getFileCharset(file));
-                update.set("contentText", markDownContent);
-            }
-            pushMessage(username, fileDocument, Constants.UPDATE_FILE);
-            if (updateResult.getModifiedCount() > 0) {
-                luceneService.pushCreateIndexQueue(fileDocument.getId());
+            messageService.pushMessage(username, fileDocument, Constants.UPDATE_FILE);
+            if (modifiedCount > 0) {
+                eventPublisher.publishEvent(new LuceneIndexQueueEvent(this, fileDocument.getId()));
             }
             // 判断文件类型中是否包含utf-8
             if (fileContentType.contains("utf-8") || fileContentType.contains("office")) {
                 // 修改文件之后保存历史版本
-                fileVersionService.saveFileVersion(username, Paths.get(relativePath, file.getName()).toString(), userId);
+                eventPublisher.publishEvent(new FileVersionEvent(this, username, Paths.get(relativePath, file.getName()).toString(), userId, userLoginHolder.getUsername()));
             }
         } else {
-            createFile(username, file, userId, null);
+            commonUserFileService.createFile(username, file, userId, null);
         }
-    }
-
-    public List<FileIntroVO> sortByFileName(UploadApiParamDTO upload, List<FileIntroVO> fileIntroVOList, String order) {
-        // 按文件名排序
-        if (CharSequenceUtil.isBlank(order)) {
-            fileIntroVOList = fileIntroVOList.stream().sorted(this::compareByFileName).toList();
-        }
-        if (!CharSequenceUtil.isBlank(order) && "name".equals(upload.getSortableProp())) {
-            fileIntroVOList = fileIntroVOList.stream().sorted(this::compareByFileName).toList();
-            if ("descending".equals(order)) {
-                fileIntroVOList = fileIntroVOList.stream().sorted(this::desc).toList();
-            }
-        }
-        return fileIntroVOList;
-    }
-
-    public int desc(FileBase f1, FileBase f2) {
-        return -1;
-    }
-
-    /***
-     * 根据文件名排序
-     * @param f1 f1
-     * @param f2 f2
-     */
-    public int compareByFileName(FileBase f1, FileBase f2) {
-        if (Boolean.TRUE.equals(f1.getIsFolder()) && !f2.getIsFolder()) {
-            return -1;
-        } else if (f1.getIsFolder() && f2.getIsFolder()) {
-            return compareByName(f1, f2);
-        } else if (!f1.getIsFolder() && Boolean.TRUE.equals(f2.getIsFolder())) {
-            return 1;
-        } else {
-            return compareByName(f1, f2);
-        }
-    }
-
-    public int compareByName(FileBase f1, FileBase f2) {
-        Comparator<Object> cmp = Collator.getInstance(java.util.Locale.CHINA);
-        return cmp.compare(f1.getName(), f2.getName());
     }
 
     /**
@@ -1190,7 +349,7 @@ public class CommonFileService {
         return f2.getUpdateDate().compareTo(f1.getUpdateDate());
     }
 
-    public static boolean isLock(FileDocument fileDocument) {
+    public static boolean isLock(FileBaseDTO fileDocument) {
         String filePath = getLockFilePath(fileDocument);
         // 完全匹配
         return isLock(filePath);
@@ -1201,13 +360,13 @@ public class CommonFileService {
         return isLock(filePath);
     }
 
-    public static void lockFile(FileDocument fileDocument) {
+    public static void lockFile(FileBaseDTO fileDocument) {
         String filePath = getLockFilePath(fileDocument);
         CommonFileService.FILE_PATH_LOCK.add(getLockFilePath(fileDocument));
         log.info("lock file path: {}", filePath);
     }
 
-    public static void unLockFile(FileDocument fileDocument) {
+    public static void unLockFile(FileBaseDTO fileDocument) {
         CommonFileService.FILE_PATH_LOCK.remove(getLockFilePath(fileDocument));
     }
 
@@ -1220,7 +379,7 @@ public class CommonFileService {
         return CommonFileService.FILE_PATH_LOCK.stream().anyMatch(filePath::startsWith);
     }
 
-    private static String getLockFilePath(FileDocument fileDocument) {
+    private static String getLockFilePath(FileBaseDTO fileDocument) {
         return fileDocument.getPath() + fileDocument.getName() + (Boolean.TRUE.equals(fileDocument.getIsFolder()) ? MyWebdavServlet.PATH_DELIMITER : "");
     }
 
@@ -1228,18 +387,6 @@ public class CommonFileService {
         Path absolutePath = file.toPath();
         Path relativePath = absolutePath.subpath(Paths.get(rooDir, username).getNameCount(), absolutePath.getNameCount());
         return MyWebdavServlet.PATH_DELIMITER + relativePath + (file.isDirectory() ? MyWebdavServlet.PATH_DELIMITER : "");
-    }
-
-    public static void setPage(Integer pageSize, Integer pageIndex, Query query) {
-        if (pageSize == null) {
-            pageSize = 10;
-        }
-        if (pageIndex == null) {
-            pageIndex = 1;
-        }
-        long skip = (long) (pageIndex - 1) * pageSize;
-        query.skip(skip);
-        query.limit(pageSize);
     }
 
     /**
@@ -1250,40 +397,24 @@ public class CommonFileService {
             boolean run = true;
             log.debug("开始删除有删除标记的文档");
             while (run) {
-                Query query = new Query();
-                query.addCriteria(Criteria.where("delete").is(1));
-                long count = mongoTemplate.count(query, CommonFileService.COLLECTION_NAME);
+                long count = fileDAO.countByDelTag(1);
                 if (count == 0) {
                     run = false;
                 }
-                List<org.bson.Document> pipeline = Arrays.asList(new org.bson.Document("$match", new org.bson.Document("delete", 1)), new org.bson.Document("$project", new org.bson.Document("_id", 1).append("name", 1).append("path", 1).append("userId", 1)), new org.bson.Document("$sort", new org.bson.Document("isFolder", 1L)), new org.bson.Document("$limit", 1));
-                AggregateIterable<org.bson.Document> aggregateIterable = mongoTemplate.getCollection(CommonFileService.COLLECTION_NAME).aggregate(pipeline);
-                for (org.bson.Document document : aggregateIterable) {
-                    Object ObjectId = document.get("_id");
-                    String fileId = null;
-                    if (ObjectId instanceof ObjectId) {
-                        fileId = document.getObjectId("_id").toHexString();
-                    }
-                    if (ObjectId instanceof String) {
-                        fileId = document.getString("_id");
-                    }
-                    String userId = document.getString("userId");
-                    String username = userService.getUserNameById(userId);
-                    String name = document.getString("name");
-                    String path = document.getString("path");
-                    File file = new File(Paths.get(fileProperties.getRootDir(), username, path, name).toString());
-                    if (!file.exists() || fileProperties.getMonitorIgnoreFilePrefix().stream().anyMatch(file.getName()::startsWith)) {
+                List<FileBaseDTO> fileBaseDTOList = fileDAO.findFileBaseDTOByDelTagOfLimit(1, 6);
+                for (FileBaseDTO fileBaseDTO : fileBaseDTOList) {
+                    String fileId = fileBaseDTO.getId();
+                    String username = userService.getUserNameById(fileBaseDTO.getUserId());
+                    File file = new File(Paths.get(fileProperties.getRootDir(), username, fileBaseDTO.getPath(), fileBaseDTO.getName()).toString());
+                    String filename = file.getName();
+                    if (!file.exists() || fileProperties.getMonitorIgnoreFilePrefix().stream().anyMatch(filename::startsWith)) {
                         deleteFile(username, file);
                         log.info("删除不存在的文档: {}", file.getAbsolutePath());
+                        fileDAO.removeById(fileId);
                     } else {
                         if (fileId != null) {
-                            log.warn("需要删除的文件: {}", file.getAbsolutePath());
-                            Query removeDeletequery = new Query();
-                            removeDeletequery.addCriteria(Criteria.where("_id").in(fileId).and("delete").is(1));
-                            Update update = new Update();
-                            update.unset("delete");
-                            UpdateResult result = mongoTemplate.updateMulti(removeDeletequery, update, CommonFileService.COLLECTION_NAME);
-                            if (result.getModifiedCount() == 0) {
+                            long getModifiedCount = fileDAO.unsetDelTag(fileId);
+                            if (getModifiedCount < 1) {
                                 log.warn("Failed to unset delete flag for file: {}", file.getAbsolutePath());
                             }
                         }
@@ -1295,21 +426,4 @@ public class CommonFileService {
         }
     }
 
-    /**
-     * 更新文件封面
-     *
-     * @param fileId    文件Id
-     * @param coverFile 封面文件
-     */
-    public void updateCoverFileDocument(String fileId, File coverFile) {
-        if (coverFile == null || !coverFile.exists()) {
-            return;
-        }
-        Query query = new Query();
-        query.addCriteria(Criteria.where("_id").is(new ObjectId(fileId)));
-        Update update = new Update();
-        generateThumbnail(coverFile, update);
-        update.set("showCover", true);
-        mongoTemplate.updateFirst(query, update, COLLECTION_NAME);
-    }
 }

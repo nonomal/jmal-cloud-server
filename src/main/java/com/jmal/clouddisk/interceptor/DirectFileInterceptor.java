@@ -2,10 +2,11 @@ package com.jmal.clouddisk.interceptor;
 
 import cn.hutool.core.text.CharSequenceUtil;
 import cn.hutool.core.util.BooleanUtil;
-import com.jmal.clouddisk.model.FileDocument;
+import com.jmal.clouddisk.model.file.FileDocument;
 import com.jmal.clouddisk.service.IUserService;
 import com.jmal.clouddisk.service.impl.DirectLinkService;
 import com.jmal.clouddisk.service.impl.FileServiceImpl;
+import com.jmal.clouddisk.service.impl.RoleService;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
@@ -33,17 +34,21 @@ public class DirectFileInterceptor implements HandlerInterceptor {
 
     private final IUserService userService;
 
+    private final RoleService roleService;
+
+    private static final int PATH_SEGMENTS_COUNT = 5;
+
     @Override
     public boolean preHandle(@NotNull HttpServletRequest request, @NotNull HttpServletResponse response, @NotNull Object handler) {
         String uri = request.getRequestURI();
         String[] pathSegments = uri.split("/");
 
         // 验证路径格式
-        if (pathSegments.length != 4 || !"direct-file".equals(pathSegments[1])) {
+        if (pathSegments.length != PATH_SEGMENTS_COUNT || !"direct-file".equals(pathSegments[PATH_SEGMENTS_COUNT - 3])) {
             response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
             return false;
         }
-        String mark = pathSegments[2];
+        String mark = pathSegments[PATH_SEGMENTS_COUNT - 2];
         String fileId = directLinkService.getFileIdByMark(mark);
         if (CharSequenceUtil.isBlank(fileId)) {
             response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
@@ -57,7 +62,7 @@ public class DirectFileInterceptor implements HandlerInterceptor {
         if (BooleanUtil.isTrue(fileDocument.getIsFolder())) {
             // 打包下载
             String username = userService.getUserNameById(fileDocument.getUserId());
-            List<String> authorities = userService.getAuthorities(username);
+            List<String> authorities = roleService.getAuthorities(username);
             if (!authorities.contains("cloud:file:packageDownload")) {
                 response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
                 return false;

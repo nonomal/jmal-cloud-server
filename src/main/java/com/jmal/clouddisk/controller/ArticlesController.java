@@ -74,11 +74,6 @@ public class ArticlesController {
         return fileService.getSitemapTxt();
     }
 
-    @GetMapping("/")
-    public String redirectToArticles() {
-        return "redirect:/public/api";
-    }
-
     @GetMapping("/articles")
     @LogOperatingFun(value = "文章列表", logType = LogOperation.Type.ARTICLE)
     public String index(HttpServletRequest request, Model map) {
@@ -147,8 +142,12 @@ public class ArticlesController {
     }
 
     private static void modifyHtml(Model map, ArticleVO articleVO) {
-        // 使用 Jsoup 解析 HTML 内容
-        Document document = Jsoup.parse(articleVO.getHtml());
+        // 使用 Jsoup 解析 HTML 内容, 使用parseBodyFragment 避免 Jsoup 自动添加 <html> 和 <body> 标签
+        Document document = Jsoup.parseBodyFragment(articleVO.getHtml());
+
+        // 关闭 "Pretty Print"（美化排版） 避免 Jsoup 自动格式化 HTML
+        document.outputSettings().prettyPrint(false);
+
         // 遍历所有 h 标签（h1, h2, h3, h4, h5, h6）
         for (int i = 1; i <= 6; i++) {
             Elements headers = document.select("h" + i);
@@ -156,7 +155,7 @@ public class ArticlesController {
                 if (!header.hasAttr("id")) {
                     String textContent = header.text();
                     // 将非字母数字字符替换为下划线
-                    String idValue = textContent.replaceAll("[^a-zA-Z0-9一-龥]", "_");
+                    String idValue = "header-" + textContent.replaceAll("[^a-zA-Z0-9一-龥\\s]", "").trim().replaceAll("\\s+", "_");
                     header.attr("id", idValue);
                 }
             }
@@ -182,7 +181,7 @@ public class ArticlesController {
             }
         }
         // 获取修改后的 HTML 内容
-        String modifiedHtmlContent = document.html();
+        String modifiedHtmlContent = document.body().html();
         articleVO.setHtml(modifiedHtmlContent);
     }
 
@@ -275,7 +274,7 @@ public class ArticlesController {
         }
         String tagId = null;
         if (!CharSequenceUtil.isBlank(tagSlugName)) {
-            TagDO tag = tagService.getTagInfoBySlug(null, tagSlugName);
+            TagDO tag = tagService.getTagInfoBySlug(tagSlugName);
             if (tag == null) {
                 return notFind(request, map);
             }
@@ -305,7 +304,7 @@ public class ArticlesController {
         ArticlesQueryVO query = new ArticlesQueryVO();
         Page<List<MarkdownVO>> articles = fileService.getArticlesByKeyword(page, pageSize, keyword);
         if (!articles.isEmpty()) {
-            MarkdownVO markdownVO = articles.getData().get(0);
+            MarkdownVO markdownVO = articles.getData().getFirst();
             query.setBackground(markdownVO.getCover());
         }
         query.setName("包含关键字 " + keyword + " 的文章");
@@ -331,7 +330,7 @@ public class ArticlesController {
         ArticlesQueryVO query = new ArticlesQueryVO();
         Page<List<MarkdownVO>> articles = fileService.getArticlesByAuthor(page, pageSize, userId);
         if (!articles.isEmpty()) {
-            MarkdownVO markdownVO = articles.getData().get(0);
+            MarkdownVO markdownVO = articles.getData().getFirst();
             query.setBackground(markdownVO.getCover());
         }
         query.setName(username + " 发布的文章");

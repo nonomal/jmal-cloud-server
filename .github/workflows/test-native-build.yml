@@ -1,0 +1,305 @@
+# 可复用工作流：单次（某一组编译参数+镜像标签）的单架构构建、推送
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: "本次构建的镜像标签（会生成 tag-arch 以及 tag 的多架构 manifest）"
+        required: true
+        type: string
+      image_name:
+        description: "本次构建的镜像名称（会生成 tag-arch 以及 tag 的多架构 manifest）"
+        required: true
+        type: string
+      profiles_active:
+        description: "--spring.profiles.active"
+        required: true
+        type: string
+      aot_build_mode:
+        description: "最终 Native Image 构建时的 -Daot.build.mode 参数"
+        required: true
+        type: string
+      arch:
+        description: "架构类型 (amd64 或 arm64)"
+        required: true
+        type: string
+      node_version:
+        description: "Node.js 版本"
+        required: false
+        type: string
+        default: "16.20.2"
+      graal_version:
+        description: "GraalVM Java 版本"
+        required: false
+        type: string
+        default: "24"
+      dockerfile:
+        description: "Dockerfile 路径（相对仓库根目录）"
+        required: false
+        type: string
+        default: "./Dockerfile"
+    secrets:
+      DOCKER_USERNAME:
+        required: true
+      DOCKER_PASSWORD:
+        required: true
+      GHCR_IO_USERNAME:
+        required: true
+      GHCR_IO_TOKEN:
+        required: true
+      MONGODB_URI:
+        required: true
+
+jobs:
+  build-single-arch:
+    runs-on: ${{ inputs.arch == 'amd64' && fromJSON('["self-hosted", "Linux", "X64"]') || fromJSON('["self-hosted", "Linux", "ARM64"]') }}
+
+    steps:
+      - name: Cleanup old failed caches
+        run: |
+          echo "Cleaning up caches older than 24 hours..."
+          find /tmp/github-actions-build-cache -type d -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+          echo "Old caches cleaned up"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout frontend
+        uses: actions/checkout@v4
+        with:
+          repository: jamebal/jmal-cloud-view
+          path: frontend
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Install frontend dependencies and Build
+        working-directory: ./frontend
+        run: |
+          npm install
+          npm run build:prod
+
+      - name: rename frontend dist
+        working-directory: ./frontend
+        run: |
+          mkdir -p frontend
+          mv dist/ frontend/
+          mv frontend/dist/ frontend/frontend/
+
+      - name: Set Maven Environmental
+        run: |
+          echo "/opt/maven/bin" >> $GITHUB_PATH
+
+      - name: Set up GraalVM environment
+        run: |
+          GRAALVM_VERSION="${{ inputs.graal_version }}"
+          GRAALVM_HOME="/opt/graalvm-jdk-${GRAALVM_VERSION}"
+
+          if [ ! -d "$GRAALVM_HOME" ]; then
+            echo "Error: GraalVM $GRAALVM_VERSION not installed"
+            exit 1
+          fi
+
+          echo "JAVA_HOME=$GRAALVM_HOME" >> $GITHUB_ENV
+          echo "$GRAALVM_HOME/bin" >> $GITHUB_PATH
+
+      - name: Check Maven version
+        run: mvn -v
+
+#      # 构建带插桩的 Native Image
+#      - name: Build Instrumented Native Image
+#        run: |
+#          mvn clean package -Pnative -Daot.build.mode=${{ inputs.aot_build_mode }}  -DskipTests -Dnative-image.jvmArgs="-Xmx32g" -Dnative-image.addArgs="--pgo-instrument -o target/jmalcloud-instrumented"
+#
+#      # 运行插桩程序以生成 Profile 文件
+#      - name: Run Instrumented App to Generate Profile
+#        env:
+#          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+#          HOME_DIR: ${{ env.HOME }}
+#        run: |
+#          chmod +x target/jmalcloud-instrumented
+#
+#          rm -rf ${HOME}/jmalcloud
+#          rm -f jmalcloud.iprof
+#
+#          mkdir -p ${HOME}/jmalcloud
+#
+#          echo "Starting instrumented application in the background..."
+#          # 在后台运行程序，并将 profile 文件名指定为 jmalcloud.iprof
+#          # 使用 & 将其放入后台
+#          ./target/jmalcloud-instrumented --spring.profiles.active=${{ inputs.profiles_active }} -XX:ProfilesDumpFile='jmalcloud.iprof' --spring.data.mongodb.uri=${{secrets.MONGODB_URI}} --file.rootDir=${HOME}/jmalcloud > "${HOME}/app.log" 2>&1 &
+#
+#          # 获取后台进程的 PID (Process ID)
+#          APP_PID=$!
+#          echo "应用程序已启动，进程ID为: $APP_PID"
+#
+#          # 等待应用启动
+#          for i in {1..30}; do
+#            if curl -s http://localhost:8088/public/health | grep -q '^UP'; then
+#              echo "App is up"
+#              break
+#            fi
+#            sleep 2
+#          done
+#
+#          # 创建管理员
+#          curl --location --request POST 'http://localhost:8088/api/public/initialization?password=123456&id=&username=admin&showName=%E7%AE%A1%E7%90%86%E5%91%981&avatar=https://wpimg.wallstcn.com/f778738c-e4f8-4870-b634-56703b4acafe.gif&slogan=&introduction=&webpDisabled=&roles=&quota=10'
+#          # 上传文件
+#          cp -r target/test-classes ${HOME}/jmalcloud/admin/
+#
+#          # 等待应用程序运行一段时间以收集性能数据
+#          echo "等待应用程序运行 120 秒以收集性能数据..."
+#          sleep 120
+#
+#          # 打印日志文件的最后 100 行
+#          tail -n 100 "${HOME}/app.log"
+#
+#          echo "发送 SIGINT 信号来优雅地终止进程，这会触发 profile 文件的写入"
+#          kill -15 $APP_PID
+#
+#          echo "等待几秒钟，让进程优雅地终止..."
+#          sleep 5
+#
+#          ls -lh 'jmalcloud.iprof'
+#
+#          ls -lh 'jmalcloud.iprof'
+#
+#      # 验证 Profile 文件是否已创建
+#      - name: Verify Profile File Creation
+#        run: |
+#          echo "Checking if profile file was created..."
+#          ls -l jmalcloud.iprof
+#          if [ ! -f "jmalcloud.iprof" ]; then
+#            echo "Error: Profile file jmalcloud.iprof was not created."
+#            exit 1
+#          fi
+
+#      # 使用传入参数构建最终优化的 Native Image
+#      - name: Build final PGO-Optimized Native Image
+#        run: |
+#          mvn clean package -Pnative -Daot.build.mode=${{ inputs.aot_build_mode }} -DskipTests -Dnative-image.jvmArgs="-Xmx15g" -Dnative-image.addArgs="--enable-monitoring=heapdump --pgo=jmalcloud.iprof"
+
+      - name: Build Native Image
+        run: |
+          mvn clean package -Pnative -Daot.build.mode=${{ inputs.aot_build_mode }} -DskipTests
+
+      # 保存构建产物到本地共享目录
+      - name: Save build artifacts to local cache
+        run: |
+          CACHE_DIR="/tmp/github-actions-build-cache/${{ github.run_id }}-${{ inputs.arch }}-${{ inputs.image_tag }}"
+          echo "Creating cache directory: $CACHE_DIR"
+          mkdir -p "$CACHE_DIR"
+          
+          echo "Copying build artifacts to cache..."
+          cp -r target/ "$CACHE_DIR/"
+          cp -r frontend/frontend/ "$CACHE_DIR/" || echo "Warning: frontend/frontend/ not found"
+          cp pom.xml "$CACHE_DIR/"
+          
+          echo "Cache directory contents:"
+          ls -lah "$CACHE_DIR"
+          
+          # 保存缓存路径供下一个 job 使用
+          echo "CACHE_DIR=$CACHE_DIR" >> $GITHUB_ENV
+          echo "Build artifacts saved to: $CACHE_DIR"
+
+  build-docker-and-push:
+    needs: build-single-arch
+    runs-on: ${{ inputs.arch == 'amd64' && fromJSON('["self-hosted", "Linux", "X64"]') || fromJSON('["self-hosted", "Linux", "ARM64"]') }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 从本地共享目录恢复构建产物
+      - name: Restore build artifacts from local cache
+        run: |
+          CACHE_DIR="/tmp/github-actions-build-cache/${{ github.run_id }}-${{ inputs.arch }}-${{ inputs.image_tag }}"
+          echo "Restoring from cache directory: $CACHE_DIR"
+          
+          if [ ! -d "$CACHE_DIR" ]; then
+            echo "Error: Cache directory not found: $CACHE_DIR"
+            exit 1
+          fi
+          
+          echo "Cache directory contents:"
+          ls -lah "$CACHE_DIR"
+          
+          echo "Copying artifacts from cache to workspace..."
+          cp -r "$CACHE_DIR"/target/ ./
+          cp -r "$CACHE_DIR"/frontend/ ./ || echo "Warning: frontend not found in cache"
+          cp "$CACHE_DIR"/pom.xml ./
+          
+          echo "Workspace after restore:"
+          ls -lah .
+          echo "Target directory:"
+          ls -lah target/ || echo "target/ not found"
+
+      # 设置 Maven 环境变量
+      - name: Set Maven Environmental
+        run: |
+          echo "/opt/maven/bin" >> $GITHUB_PATH
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_IO_USERNAME }}
+          password: ${{ secrets.GHCR_IO_TOKEN }}
+
+      - name: Set up GraalVM environment
+        run: |
+          GRAALVM_VERSION="${{ inputs.graal_version }}"
+          GRAALVM_HOME="/opt/graalvm-jdk-${GRAALVM_VERSION}"
+
+          if [ ! -d "$GRAALVM_HOME" ]; then
+            echo "Error: GraalVM $GRAALVM_VERSION not installed"
+            exit 1
+          fi
+
+          echo "JAVA_HOME=$GRAALVM_HOME" >> $GITHUB_ENV
+          echo "$GRAALVM_HOME/bin" >> $GITHUB_PATH
+
+      - name: Check Maven version
+        run: mvn -v
+
+      - name: Extract project version from pom.xml
+        id: project_version
+        run: |
+          VERSION=$(mvn -q -Dexec.executable=echo -Dexec.args='${project.version}' --non-recursive exec:exec)
+          echo "PROJECT_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push arch-specific image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
+          provenance: false
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: |
+            jmal/${{ inputs.image_name }}:${{ inputs.image_tag }}-${{ inputs.arch }}
+            ghcr.io/${{ secrets.GHCR_IO_USERNAME }}/${{ inputs.image_name }}:${{ inputs.image_tag }}-${{ inputs.arch }}
+          platforms: linux/${{ inputs.arch }}
+          build-args: |
+            VERSION=${{ env.PROJECT_VERSION }}
+
+      - name: Inspect the pushed image RIGHT AFTER push
+        if: ${{ success() }}
+        run: |
+          echo "--- Inspecting Docker Hub image ---"
+          docker manifest inspect jmal/${{ inputs.image_name }}:${{ inputs.image_tag }}-${{ inputs.arch }}
+
+          echo "--- Inspecting GHCR image ---"
+          docker manifest inspect ghcr.io/${{ secrets.GHCR_IO_USERNAME }}/${{ inputs.image_name }}:${{ inputs.image_tag }}-${{ inputs.arch }}

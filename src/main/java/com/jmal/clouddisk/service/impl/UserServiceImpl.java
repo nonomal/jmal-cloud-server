@@ -1,15 +1,22 @@
 package com.jmal.clouddisk.service.impl;
 
+import cn.hutool.core.codec.Base64;
+import cn.hutool.core.convert.Convert;
 import cn.hutool.core.io.file.PathUtil;
 import cn.hutool.core.text.CharSequenceUtil;
-import cn.hutool.core.thread.ThreadUtil;
 import cn.hutool.core.util.BooleanUtil;
-import cn.hutool.core.util.HexUtil;
+import cn.hutool.core.util.RandomUtil;
 import cn.hutool.core.util.StrUtil;
-import cn.hutool.crypto.symmetric.SymmetricAlgorithm;
-import cn.hutool.crypto.symmetric.SymmetricCrypto;
-import com.jmal.clouddisk.annotation.AnnoManageUtil;
 import com.jmal.clouddisk.config.FileProperties;
+import com.jmal.clouddisk.dao.IAccessTokenDAO;
+import com.jmal.clouddisk.dao.IGroupDAO;
+import com.jmal.clouddisk.dao.IRoleDAO;
+import com.jmal.clouddisk.dao.IUserDAO;
+import com.jmal.clouddisk.dao.IWebsiteSettingDAO;
+import com.jmal.clouddisk.dao.mapping.CommonField;
+import com.jmal.clouddisk.dao.mapping.UserField;
+import com.jmal.clouddisk.dao.util.MyQuery;
+import com.jmal.clouddisk.dao.util.MyUpdate;
 import com.jmal.clouddisk.exception.CommonException;
 import com.jmal.clouddisk.exception.ExceptionType;
 import com.jmal.clouddisk.listener.FileMonitor;
@@ -19,25 +26,29 @@ import com.jmal.clouddisk.model.query.QueryUserDTO;
 import com.jmal.clouddisk.model.rbac.ConsumerBase;
 import com.jmal.clouddisk.model.rbac.ConsumerDO;
 import com.jmal.clouddisk.model.rbac.ConsumerDTO;
-import com.jmal.clouddisk.repository.IAuthDAO;
-import com.jmal.clouddisk.service.IFileService;
+import com.jmal.clouddisk.model.rbac.Personalization;
 import com.jmal.clouddisk.service.IShareService;
 import com.jmal.clouddisk.service.IUserService;
-import com.jmal.clouddisk.util.*;
-import org.jetbrains.annotations.Nullable;
+import com.jmal.clouddisk.util.CaffeineUtil;
+import com.jmal.clouddisk.util.PasswordHash;
+import com.jmal.clouddisk.util.ResponseResult;
+import com.jmal.clouddisk.util.ResultUtil;
+import com.jmal.clouddisk.util.SystemUtil;
+import com.jmal.clouddisk.util.TimeUntils;
+import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.schedulers.Schedulers;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.jetbrains.annotations.NotNull;
 import org.springframework.beans.BeanUtils;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.mongodb.core.MongoTemplate;
-import org.springframework.data.mongodb.core.query.Criteria;
-import org.springframework.data.mongodb.core.query.Query;
-import org.springframework.data.mongodb.core.query.Update;
+import org.springframework.data.domain.Page;
 import org.springframework.security.crypto.encrypt.TextEncryptor;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.nio.file.Paths;
+import java.time.Instant;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
@@ -46,48 +57,44 @@ import java.util.List;
  * @Description UserServiceImpl
  */
 @Service
+@Slf4j
+@RequiredArgsConstructor
 public class UserServiceImpl implements IUserService {
 
     public static final String COLLECTION_NAME = "user";
 
-    public static final String ROLES = "roles";
+    private final IUserDAO userDAO;
 
-    @Autowired
-    private MongoTemplate mongoTemplate;
+    private final IRoleDAO roleDAO;
 
-    @Autowired
-    private IFileService fileService;
+    private final IGroupDAO groupDAO;
 
-    @Autowired
-    private IShareService shareService;
+    private final IWebsiteSettingDAO websiteSettingDAO;
 
-    @Autowired
-    private MenuService menuService;
+    private final CommonUserService commonUserService;
 
-    @Autowired
-    private RoleService roleService;
+    private final UserFileService userFileService;
 
-    @Autowired
-    private IAuthDAO authDAO;
+    private final MessageService messageService;
 
-    @Autowired
-    private FileProperties fileProperties;
+    private final IShareService shareService;
 
-    @Autowired
-    private UserLoginHolder userLoginHolder;
+    private final RoleService roleService;
 
-    @Autowired
-    private FileMonitor fileMonitor;
+    private final IAccessTokenDAO accessTokenDAO;
 
-    @Autowired
-    private TextEncryptor textEncryptor;
+    private final FileProperties fileProperties;
+
+    private final UserLoginHolder userLoginHolder;
+
+    private final FileMonitor fileMonitor;
+
+    private final TextEncryptor textEncryptor;
 
     @Override
     public synchronized ConsumerDO add(ConsumerDTO consumerDTO) {
         String username = consumerDTO.getUsername();
-        if (fileProperties.notAllowUsername(username)) {
-            throw new CommonException(ExceptionType.WARNING.getCode(), "请使用其他用户名");
-        }
+        checkUsername(username);
         ConsumerDO consumerDO;
         ConsumerDO user1 = getUserInfoByUsername(username);
         if (user1 == null) {
@@ -98,17 +105,38 @@ public class UserServiceImpl implements IUserService {
             encryption(consumerDTO, originalPwd);
             consumerDO = new ConsumerDO();
             BeanUtils.copyProperties(consumerDTO, consumerDO);
-            consumerDO.setCreateTime(LocalDateTime.now(TimeUntils.ZONE_ID));
+            consumerDO.setCreatedTime(Instant.now());
             consumerDO.setId(null);
             // 新建用户目录
             createUserDir(consumerDO.getUsername());
-            consumerDO = mongoTemplate.save(consumerDO, COLLECTION_NAME);
+            consumerDO = userDAO.save(consumerDO);
             // 更新用户缓存
             CaffeineUtil.setConsumerByUsernameCache(consumerDO.getUsername(), consumerDO);
         } else {
             throw new CommonException(ExceptionType.WARNING.getCode(), "该用户已存在");
         }
         return consumerDO;
+    }
+
+    private void checkUsername(String username) {
+        if (isNotValidUsername(username)) {
+            throw new CommonException(ExceptionType.WARNING.getCode(), "非法的用户名格式");
+        }
+        if (fileProperties.notAllowUsername(username)) {
+            throw new CommonException(ExceptionType.WARNING.getCode(), "请使用其他用户名");
+        }
+    }
+
+    /**
+     * 验证用户名是否安全
+     */
+    public static boolean isNotValidUsername(String username) {
+        if (username == null || username.isEmpty()) {
+            return true;
+        }
+
+        // 只允许字母、数字、下划线、连字符
+        return !username.matches("^[a-zA-Z0-9_-]+$");
     }
 
     /**
@@ -127,9 +155,7 @@ public class UserServiceImpl implements IUserService {
         if (idList.contains(currentUserId)) {
             return ResultUtil.warning("不能删除自己");
         }
-        Query query1 = new Query();
-        query1.addCriteria(Criteria.where("_id").in(idList));
-        List<ConsumerDO> userList = mongoTemplate.find(query1, ConsumerDO.class, COLLECTION_NAME);
+        List<ConsumerDO> userList = userDAO.findAllById(idList);
         // 过滤掉创建者
         ConsumerDO creator = userList.stream().filter(user -> user.getCreator() != null && user.getCreator()).findAny().orElse(null);
         if (creator != null) {
@@ -137,16 +163,14 @@ public class UserServiceImpl implements IUserService {
             userList.remove(creator);
         }
         // 删除关联文件
-        fileService.deleteAllByUser(userList);
+        userFileService.deleteAllByUser(userList);
         // 删除关联分享
         shareService.deleteAllByUser(userList);
         // 删除关联token
-        authDAO.deleteAllByUser(userList);
+        accessTokenDAO.deleteAllByUser(userList);
         // 删除用户缓存
         CaffeineUtil.removeConsumerListByUsernameCache(userList);
-        Query query = new Query();
-        query.addCriteria(Criteria.where("_id").in(idList));
-        mongoTemplate.remove(query, COLLECTION_NAME);
+        userDAO.deleteAllById(idList);
         return ResultUtil.success();
     }
 
@@ -154,19 +178,16 @@ public class UserServiceImpl implements IUserService {
     public ResponseResult<Object> update(ConsumerDTO user, MultipartFile blobAvatar) {
 
         String name = user.getUsername();
-        if (fileProperties.notAllowUsername(name)) {
-            return ResultUtil.warning("请使用其他用户名");
-        }
-
-        Query query = new Query();
+        MyQuery query = new MyQuery();
         String userId = user.getId();
         ConsumerDO consumerDO;
         if (!CharSequenceUtil.isBlank(userId)) {
-            query.addCriteria(Criteria.where("_id").is(userId));
+            query.eq(CommonField.ID.getLogical(), userId);
             consumerDO = getUserInfoById(userId);
         } else {
             if (!CharSequenceUtil.isBlank(name)) {
-                query.addCriteria(Criteria.where(USERNAME).is(name));
+                checkUsername(name);
+                query.eq(USERNAME, name);
                 consumerDO = getUserInfoByUsername(name);
             } else {
                 return ResultUtil.success();
@@ -175,10 +196,10 @@ public class UserServiceImpl implements IUserService {
         if (consumerDO == null) {
             consumerDO = new ConsumerDO();
         }
-        Update update = new Update();
+        MyUpdate update = new MyUpdate();
         String showName = user.getShowName();
         if (!CharSequenceUtil.isBlank(showName)) {
-            update.set(SHOW_NAME, showName);
+            update.set(UserField.SHOW_NAME.getLogical(), showName);
             consumerDO.setShowName(showName);
         }
         Integer quota = user.getQuota();
@@ -191,6 +212,7 @@ public class UserServiceImpl implements IUserService {
             update.set("slogan", slogan);
             consumerDO.setSlogan(slogan);
         }
+
         String introduction = user.getIntroduction();
         if (!CharSequenceUtil.isBlank(introduction)) {
             update.set("introduction", introduction);
@@ -198,6 +220,13 @@ public class UserServiceImpl implements IUserService {
             update.set("introduction", "");
         }
         consumerDO.setIntroduction(introduction);
+
+        Boolean webpDisabled = user.getWebpDisabled();
+        if (webpDisabled != null) {
+            update.set(UserField.WEBP_DISABLED.getLogical(), webpDisabled);
+            consumerDO.setWebpDisabled(webpDisabled);
+        }
+
         String fileId = "";
         if (!CharSequenceUtil.isBlank(user.getAvatar())) {
             fileId = user.getAvatar();
@@ -205,56 +234,76 @@ public class UserServiceImpl implements IUserService {
             consumerDO.setAvatar(fileId);
         }
         if (user.getRoles() != null) {
-            update.set(ROLES, user.getRoles());
+            update.set(RoleService.ROLES, user.getRoles());
             consumerDO.setRoles(user.getRoles());
+        }
+        if (user.getGroups() != null) {
+            update.set("groups", user.getGroups());
+            consumerDO.setGroups(user.getGroups());
         }
         // 设置用户头像
         fileId = setConsumerAvatar(blobAvatar, userId, consumerDO, update, fileId);
-        LocalDateTime now = LocalDateTime.now(TimeUntils.ZONE_ID);
-        update.set("updateTime", now);
-        consumerDO.setUpdateTime(now);
+        Instant now = Instant.now();
+        update.set(UserField.UPDATED_TIME.getLogical(), now);
+        consumerDO.setUpdatedTime(now);
         updateConsumer(userId, query, update);
-        if (user.getRoles() != null) {
+        if (user.getRoles() != null || user.getGroups() != null) {
             // 修改用户角色后更新相关角色用户的权限缓存
-            ThreadUtil.execute(() -> roleService.updateUserCacheByRole(user.getRoles()));
+            ConsumerDO finalConsumerDO = consumerDO;
+            Completable.fromAction(() -> {
+                        // 直接刷新该用户的权限缓存，比通过角色反查用户更直接
+                        // 如果只是修改了当前用户的配置，直接刷新该用户即可
+                        if (finalConsumerDO.getUsername() != null) {
+                            roleService.refreshUserAuthoritiesCache(finalConsumerDO.getUsername());
+                        }
+                    })
+                    .subscribeOn(Schedulers.io())
+                    .doOnError(e -> log.error(e.getMessage(), e))
+                    .onErrorComplete()
+                    .subscribe();
         }
         return ResultUtil.success(fileId);
     }
 
-    private String setConsumerAvatar(MultipartFile blobAvatar, String userId, ConsumerDO consumerDO, Update update, String fileId) {
+    private String setConsumerAvatar(MultipartFile blobAvatar, String userId, ConsumerDO consumerDO, MyUpdate update, String fileId) {
         if (blobAvatar != null) {
-            ConsumerDO consumer = mongoTemplate.findById(userId, ConsumerDO.class, COLLECTION_NAME);
+            ConsumerDO consumer = userDAO.findById(userId);
             if (consumer != null) {
                 UploadApiParamDTO upload = new UploadApiParamDTO();
                 upload.setUserId(userId);
                 upload.setUsername(consumer.getUsername());
                 upload.setFilename("avatar-" + System.currentTimeMillis());
                 upload.setFile(blobAvatar);
-                fileId = fileService.uploadConsumerImage(upload);
+                fileId = userFileService.uploadConsumerImage(upload);
                 update.set("avatar", fileId);
                 consumerDO.setAvatar(fileId);
             }
         } else {
             // 设置头像文件为public
-            fileService.setPublic(fileId);
+            userFileService.setPublic(fileId);
         }
         return fileId;
     }
 
     @Override
     public ResponseResult<ConsumerDTO> userInfo(String id) {
-        ConsumerDO consumer = mongoTemplate.findById(id, ConsumerDO.class, COLLECTION_NAME);
+        ConsumerDO consumer = userDAO.findById(id);
+        return getConsumerDTOResponseResult(consumer);
+    }
+
+    @NotNull
+    private ResponseResult<ConsumerDTO> getConsumerDTOResponseResult(ConsumerDO consumer) {
         if (consumer == null) {
             return ResultUtil.success(new ConsumerDTO());
         }
         ConsumerDTO consumerDTO = new ConsumerDTO();
         BeanUtils.copyProperties(consumer, consumerDTO);
-        consumerDTO.setTakeUpSpace(fileService.takeUpSpace(consumerDTO.getId()));
+        consumerDTO.setTakeUpSpace(messageService.takeUpSpace(consumerDTO.getId()));
         consumerDTO.setPassword(null);
         if (consumerDTO.getAvatar() == null) {
             consumerDTO.setAvatar("");
         }
-        WebsiteSettingDO websiteSettingDO = mongoTemplate.findOne(new Query(), WebsiteSettingDO.class, SettingService.COLLECTION_NAME_WEBSITE_SETTING);
+        WebsiteSettingDO websiteSettingDO = websiteSettingDAO.findOne();
         if (websiteSettingDO != null) {
             consumerDTO.setNetdiskName(websiteSettingDO.getNetdiskName());
             consumerDTO.setNetdiskLogo(websiteSettingDO.getNetdiskLogo());
@@ -270,53 +319,32 @@ public class UserServiceImpl implements IUserService {
 
     @Override
     public ResponseResult<ConsumerDTO> info() {
-        if (StrUtil.isBlank(userLoginHolder.getUserId())) {
+        if (StrUtil.isBlank(userLoginHolder.getUsername())) {
             return ResultUtil.success(new ConsumerDTO());
         }
-        return userInfo(userLoginHolder.getUserId());
+        ConsumerDO consumerDO = getUserInfoByUsername(userLoginHolder.getUsername());
+        return getConsumerDTOResponseResult(consumerDO);
     }
 
     @Override
     public ConsumerDO userInfoById(String userId) {
-        if (CharSequenceUtil.isBlank(userId)) {
-            return null;
-        }
-        return mongoTemplate.findById(userId, ConsumerDO.class, COLLECTION_NAME);
+        return getUserInfoById(userId);
     }
 
     @Override
     public ResponseResult<List<ConsumerDTO>> userList(QueryUserDTO queryDTO) {
-        Query query = new Query();
-        long count = mongoTemplate.count(query, COLLECTION_NAME);
-        MongoUtil.commonQuery(queryDTO, query);
-        if (!CharSequenceUtil.isBlank(queryDTO.getUsername())) {
-            query.addCriteria(Criteria.where(USERNAME).regex(queryDTO.getUsername(), "i"));
-        }
-        if (!CharSequenceUtil.isBlank(queryDTO.getShowName())) {
-            query.addCriteria(Criteria.where(SHOW_NAME).regex(queryDTO.getShowName(), "i"));
-        }
-        List<ConsumerDO> userList = mongoTemplate.find(query, ConsumerDO.class, COLLECTION_NAME);
+        Page<ConsumerDO> consumerDOPage = userDAO.findUserList(queryDTO);
+        List<ConsumerDO> userList = consumerDOPage.getContent();
         List<ConsumerDTO> consumerDTOList = userList.parallelStream().map(consumerDO -> {
             ConsumerDTO consumerDTO = new ConsumerDTO();
-            BeanUtils.copyProperties(consumerDO, consumerDTO);
-            List<String> roleIds = consumerDO.getRoles();
-            if (roleIds != null && !roleIds.isEmpty()) {
-                consumerDTO.setRoleList(roleService.getRoleList(roleIds));
-            }
-            return consumerDTO;
-        }).toList();
-        return ResultUtil.success(consumerDTOList).setCount(count);
-    }
-
-    @Override
-    public List<ConsumerDTO> userListAll() {
-        Query query = new Query();
-        List<ConsumerDO> userList = mongoTemplate.find(query, ConsumerDO.class, COLLECTION_NAME);
-        return userList.parallelStream().map(consumerDO -> {
-            ConsumerDTO consumerDTO = new ConsumerDTO();
+            consumerDTO.setId(consumerDO.getId());
             consumerDTO.setUsername(consumerDO.getUsername());
+            consumerDTO.setShowName(consumerDO.getShowName());
+            consumerDTO.setGroups(consumerDO.getGroups());
+            consumerDTO.setRoles(consumerDO.getRoles());
             return consumerDTO;
         }).toList();
+        return ResultUtil.success(consumerDTOList).setCount(consumerDOPage.getTotalElements());
     }
 
     @Override
@@ -324,7 +352,7 @@ public class UserServiceImpl implements IUserService {
         String userId = consumer.getId();
         String newPassword = consumer.getPassword();
         if (!CharSequenceUtil.isBlank(userId) && !CharSequenceUtil.isBlank(newPassword)) {
-            ConsumerDO consumer1 = mongoTemplate.findById(userId, ConsumerDO.class, COLLECTION_NAME);
+            ConsumerDO consumer1 = userDAO.findById(userId);
             if (consumer1 != null) {
                 if (newPassword.equals(consumer1.getPassword())) {
                     return ResultUtil.warning("新密码不能与旧密码相同!");
@@ -341,7 +369,6 @@ public class UserServiceImpl implements IUserService {
         String userId = consumer.getId();
         if (!CharSequenceUtil.isBlank(userId)) {
             String originalPwd = "jmalcloud";
-            // password 1000:0b69ec810783195a102a73c12d4794c29d06904de2f95da1:37c6a397accb83909dc1d15824b8ffb6010649aad9567e99
             updatePwd(userId, originalPwd);
             return ResultUtil.successMsg("重置密码成功!");
         }
@@ -352,66 +379,30 @@ public class UserServiceImpl implements IUserService {
         if (originalPwd.length() < 8) {
             throw new CommonException(ExceptionType.WARNING.getCode(), "密码长度不能少于8位");
         }
-        Query query = new Query();
-        query.addCriteria(Criteria.where("_id").is(userId));
-        Update update = new Update();
+        MyQuery query = new MyQuery();
+        query.eq(CommonField.ID.getLogical(), userId);
+        MyUpdate update = new MyUpdate();
         String password = PasswordHash.createHash(originalPwd);
         LocalDateTime now = LocalDateTime.now(TimeUntils.ZONE_ID);
         update.set("password", password);
-        update.set("updateTime", now);
+        update.set(UserField.UPDATED_TIME.getLogical(), now);
         updateConsumer(userId, query, update);
     }
 
-    private void updateConsumer(String userId, Query query, Update update) {
-        mongoTemplate.upsert(query, update, COLLECTION_NAME);
-        ConsumerDO consumerDO = getUserInfoById(userId);
+    private void updateConsumer(String userId, MyQuery query, MyUpdate update) {
+        userDAO.upsert(query, update);
+        ConsumerDO consumerDO = commonUserService.getUserInfoByIdNoCache(userId);
         CaffeineUtil.setConsumerByUsernameCache(consumerDO.getUsername(), consumerDO);
     }
 
     @Override
     public String getUserIdByUserName(String username) {
-        ConsumerDO consumer = getUserInfoByUsername(username);
-        if (consumer != null) {
-            return consumer.getId();
-        }
-        return null;
-    }
-
-    public String getShowNameByUserUsername(String username) {
-        ConsumerDO consumer = getUserInfoByUsername(username);
-        if (consumer == null) {
-            return "";
-        }
-        return consumer.getShowName();
+        return commonUserService.getUserIdByUserName(username);
     }
 
     @Override
     public String getAvatarByUsername(String username) {
-        ConsumerDO consumer = getUserInfoByUsername(username);
-        if (consumer == null) {
-            return "";
-        }
-        return consumer.getAvatar();
-    }
-
-    public static String getDecryptStrByUser(String secret, ConsumerDO consumer) {
-        String key = getPwdKey(consumer);
-        if (key == null) return "";
-        return getAES(key).decryptStr(secret);
-    }
-
-    @Nullable
-    private static String getPwdKey(ConsumerDO consumer) {
-        if (consumer == null) {
-            return null;
-        }
-        if (consumer.getPassword() == null) {
-            return null;
-        }
-        if (consumer.getPassword().split(":").length < 2) {
-            return null;
-        }
-        return consumer.getPassword().split(":")[2];
+        return commonUserService.getAvatarByUsername(username);
     }
 
     public String getHashPasswordUserName(String username) {
@@ -427,8 +418,7 @@ public class UserServiceImpl implements IUserService {
 
     @Override
     public ResponseResult<Boolean> hasUser() {
-        Query query = new Query();
-        long count = mongoTemplate.count(query, COLLECTION_NAME);
+        long count = userDAO.count();
         if (count > 0) {
             count = 1;
         }
@@ -437,14 +427,11 @@ public class UserServiceImpl implements IUserService {
 
     @Override
     public synchronized ResponseResult<Object> initialization(ConsumerDTO consumerDTO) {
-        Query query = new Query();
-        long count = mongoTemplate.count(query, COLLECTION_NAME);
+        long count = userDAO.count();
         if (count < 1) {
             ConsumerDO user = new ConsumerDO();
+            checkUsername(consumerDTO.getUsername());
             BeanUtils.copyProperties(consumerDTO, user);
-            // 首先初始化菜单和角色
-            menuService.initMenus();
-            roleService.initRoles();
             // 再初始化创建者
             String roleId = roleService.getRoleIdByCode(RoleService.ADMINISTRATORS);
             user.setRoles(Collections.singletonList(roleId));
@@ -453,11 +440,11 @@ public class UserServiceImpl implements IUserService {
             user.setQuota((int) (SystemUtil.getFreeSpace() / 2));
             String originalPwd = user.getPassword();
             encryption(user, originalPwd);
-            user.setCreateTime(LocalDateTime.now(TimeUntils.ZONE_ID));
+            user.setCreatedTime(Instant.now());
             user.setId(null);
             // 新建用户目录
             createUserDir(user.getUsername());
-            mongoTemplate.save(user, COLLECTION_NAME);
+            userDAO.save(user);
         }
         return ResultUtil.success();
     }
@@ -473,63 +460,14 @@ public class UserServiceImpl implements IUserService {
         user.setPassword(password);
     }
 
-    public static String getEncryptPwd(String originalPwd, String password) {
-        return getAES(password.split(":")[2]).encryptHex(originalPwd);
-    }
-
-
-    private static SymmetricCrypto getAES(String key) {
-        return new SymmetricCrypto(SymmetricAlgorithm.AES, HexUtil.decodeHex(key));
-    }
-
     @Override
     public String getUserNameById(String userId) {
-        if (!CharSequenceUtil.isBlank(userId)) {
-            String username = CaffeineUtil.getUsernameCache(userId);
-            if (CharSequenceUtil.isBlank(username)) {
-                ConsumerDO consumer = mongoTemplate.findById(userId, ConsumerDO.class, COLLECTION_NAME);
-                if (consumer != null) {
-                    username = consumer.getUsername();
-                    CaffeineUtil.setUsernameCache(userId, username);
-                    return username;
-                }
-            } else {
-                return username;
-            }
-        }
-        return "";
-    }
-
-    @Override
-    public void disabledWebp(String userId, Boolean disabled) {
-        Query query = new Query();
-        query.addCriteria(Criteria.where("_id").is(userId));
-        Update update = new Update();
-        update.set("webpDisabled", disabled);
-        updateConsumer(userId, query, update);
-    }
-
-    @Override
-    public boolean getDisabledWebp(String userId) {
-        Query query = new Query();
-        query.addCriteria(Criteria.where("_id").is(userId));
-        ConsumerDO consumer = mongoTemplate.findOne(query, ConsumerDO.class, COLLECTION_NAME);
-        if (consumer != null && consumer.getWebpDisabled() != null) {
-            return consumer.getWebpDisabled();
-        }
-        return true;
+        return commonUserService.getUserNameById(userId);
     }
 
     @Override
     public ConsumerDO getUserInfoByUsername(String name) {
-        ConsumerDO consumer = CaffeineUtil.getConsumerByUsernameCache(name);
-        if (consumer == null) {
-            consumer = getUserInfo(name);
-            if (consumer != null) {
-                CaffeineUtil.setConsumerByUsernameCache(name, consumer);
-            }
-        }
-        return consumer;
+        return commonUserService.getUserInfoByUsername(name);
     }
 
     @Override
@@ -545,96 +483,36 @@ public class UserServiceImpl implements IUserService {
     public void enableMfa(String userId, String rawSecret) {
         // 加密密钥
         String encryptedSecret = textEncryptor.encrypt(rawSecret);
-        Query query = new Query();
-        query.addCriteria(Criteria.where("_id").is(userId));
-        Update update = new Update();
-        update.set("mfaSecret", encryptedSecret);
-        update.set("mfaEnabled", true);
+        MyQuery query = new MyQuery();
+        query.eq(CommonField.ID.getLogical(), userId);
+        MyUpdate update = new MyUpdate();
+        update.set(UserField.MFA_SECRET.getLogical(), encryptedSecret);
+        update.set(UserField.MFA_ENABLED.getLogical(), true);
         updateConsumer(userId, query, update);
     }
 
     @Override
     public void disableMfa(String userId) {
-        Query query = new Query();
-        query.addCriteria(Criteria.where("_id").is(userId));
-        Update update = new Update();
-        update.unset("mfaSecret");
-        update.unset("mfaEnabled");
+        MyQuery query = new MyQuery();
+        query.eq(CommonField.ID.getLogical(), userId);
+        MyUpdate update = new MyUpdate();
+        update.unset(UserField.MFA_SECRET.getLogical());
+        update.unset(UserField.MFA_ENABLED.getLogical());
         updateConsumer(userId, query, update);
     }
 
+    @Override
+    public String getUsername(String userId) {
+        return userDAO.getUsernameById(userId);
+    }
+
     public ConsumerDO getUserInfoById(String userId) {
-        return mongoTemplate.findById(userId, ConsumerDO.class, COLLECTION_NAME);
-    }
-
-    private ConsumerDO getUserInfo(String username) {
-        Query query = new Query();
-        query.addCriteria(Criteria.where(USERNAME).is(username));
-        return mongoTemplate.findOne(query, ConsumerDO.class, COLLECTION_NAME);
-    }
-
-    @Override
-    public List<String> getAuthorities(String username) {
-        List<String> authorities = new ArrayList<>();
-        ConsumerDO consumerDO = getUserInfoByUsername(username);
-        if (consumerDO == null) {
-            return authorities;
-        }
-        // 如果是创建者, 直接返回所有权限
-        if (consumerDO.getCreator() != null && consumerDO.getCreator()) {
-            return AnnoManageUtil.AUTHORITIES;
-        }
-        List<String> roleIdList = consumerDO.getRoles();
-        if (roleIdList == null || roleIdList.isEmpty()) {
-            return authorities;
-        }
-        return roleService.getAuthorities(roleIdList);
-    }
-
-    @Override
-    public List<String> getMenuIdList(String userId) {
-        List<String> menuIdList = new ArrayList<>();
-        ConsumerDO consumerDO = mongoTemplate.findById(userId, ConsumerDO.class, COLLECTION_NAME);
-        if (consumerDO == null || consumerDO.getRoles() == null) {
-            return menuIdList;
-        }
-        if (consumerDO.getCreator() != null && consumerDO.getCreator()) {
-            // 如果是创建者则返回所有菜单
-            return menuService.getAllMenuIdList();
-        }
-        return roleService.getMenuIdList(consumerDO.getRoles());
-    }
-
-    @Override
-    public List<String> getUserNameListByRole(String roleId) {
-        Query query = new Query();
-        query.addCriteria(Criteria.where(ROLES).is(roleId));
-        List<ConsumerDO> userList = mongoTemplate.find(query, ConsumerDO.class, COLLECTION_NAME);
-        return userList.stream().map(ConsumerDO::getUsername).toList();
-    }
-
-    @Override
-    public List<String> getUserNameListByRole(List<String> rolesIds) {
-        Query query = new Query();
-        query.addCriteria(Criteria.where(ROLES).in(rolesIds));
-        List<ConsumerDO> userList = mongoTemplate.find(query, ConsumerDO.class, COLLECTION_NAME);
-        return userList.stream().map(ConsumerDO::getUsername).toList();
-    }
-
-    @Override
-    public boolean getIsCreator(String userId) {
-        ConsumerDO consumerDO = mongoTemplate.findById(userId, ConsumerDO.class, COLLECTION_NAME);
-        if (consumerDO == null) {
-            return false;
-        }
-        return consumerDO.getCreator() != null && consumerDO.getCreator();
+        return commonUserService.getUserInfoById(userId);
     }
 
     @Override
     public String getUserIdByShowName(String showName) {
-        Query query = new Query();
-        query.addCriteria(Criteria.where(SHOW_NAME).is(showName));
-        ConsumerDO consumerDO = mongoTemplate.findOne(query, ConsumerDO.class, COLLECTION_NAME);
+        ConsumerDO consumerDO = userDAO.findByShowName(showName);
         if (consumerDO != null) {
             return consumerDO.getId();
         }
@@ -643,29 +521,60 @@ public class UserServiceImpl implements IUserService {
 
     /**
      * 获取创建者的头像
+     *
      * @return 头像文件Id
      */
     public String getCreatorAvatar() {
-        Query query = new Query();
-        query.addCriteria(Criteria.where("creator").is(true));
-        ConsumerDO consumerDO = mongoTemplate.findOne(query, ConsumerDO.class, COLLECTION_NAME);
+        ConsumerDO consumerDO = userDAO.findOneByCreatorTrue();
         if (consumerDO == null) {
             return null;
         }
         return consumerDO.getAvatar();
     }
 
-    /**
-     * 获取创建者的用户名
-     * @return 用户名
-     */
-    public String getCreatorUsername() {
-        Query query = new Query();
-        query.addCriteria(Criteria.where("creator").is(true));
-        ConsumerDO consumerDO = mongoTemplate.findOne(query, ConsumerDO.class, COLLECTION_NAME);
-        if (consumerDO == null) {
-            return null;
+    // 重置管理员密码
+    public void resetAdminPassword() {
+        if (BooleanUtil.isTrue(fileProperties.getResetAdminPassword())) {
+            ConsumerDO consumer = userDAO.findOneByCreatorTrue();
+            if (consumer == null) {
+                return;
+            }
+            if (BooleanUtil.isTrue(consumer.getCreator())) {
+                // 生成密码
+                String randomPass = Base64.encodeUrlSafe(Convert.toStr(RandomUtil.randomInt(100000, 1000000)));
+                String hash = PasswordHash.createHash(randomPass);
+                if (userDAO.resetAdminPassword(hash)) {
+                    log.warn("管理员: {}, 密码已重置为: {}，请务必将环境变量'RESET_ADMIN_PASSWORD'移除或设置为false！", consumer.getUsername(), randomPass);
+                }
+                // 禁用MFA
+                disableMfa(consumer.getId());
+            }
         }
-        return consumerDO.getUsername();
+    }
+
+    public Personalization getPersonalization(String username) {
+        return java.util.Optional.ofNullable(getUserInfoByUsername(username))
+                .map(ConsumerDO::getPersonalization)
+                .orElseGet(Personalization::new);
+    }
+
+    public void savePersonalization(String username, Personalization personalization) {
+        ConsumerDO consumerDO = getUserInfoByUsername(username);
+        if (consumerDO != null) {
+            MyQuery query = new MyQuery();
+            query.eq(CommonField.ID.getLogical(), consumerDO.getId());
+            MyUpdate update = new MyUpdate();
+            update.set("personalization", personalization);
+            updateConsumer(consumerDO.getId(), query, update);
+        }
+    }
+
+    public void resetMfaForAllUsers() {
+        if (!commonUserService.getIsCreator(userLoginHolder.getUserId())) {
+            throw new CommonException(ExceptionType.PERMISSION_DENIED);
+        }
+        userDAO.resetMfaForAllUsers();
+        // 清除缓存
+        CaffeineUtil.invalidateAllConsumerCache();
     }
 }

@@ -1,19 +1,19 @@
 package com.jmal.clouddisk.office.model;
 
 import cn.hutool.core.util.StrUtil;
-import cn.hutool.crypto.symmetric.SymmetricAlgorithm;
-import cn.hutool.crypto.symmetric.SymmetricCrypto;
-import com.jmal.clouddisk.office.OfficeConfigService;
+import com.jmal.clouddisk.config.Reflective;
+import com.jmal.clouddisk.service.Constants;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Pattern;
 import lombok.Data;
+import org.springframework.security.crypto.encrypt.TextEncryptor;
 
 import java.util.List;
 
 @Data
 @Valid
-public class OfficeConfigDTO {
+public class OfficeConfigDTO implements Reflective {
 
     @Pattern(
             regexp = "^(https?://)([\\w.-]+)(:[0-9]+)?(/.*)?$|^$",
@@ -38,24 +38,20 @@ public class OfficeConfigDTO {
     @Schema(name = "format", title = "默认关联的文件格式")
     private List<String> format;
 
-    public OfficeConfigDO toOfficeConfigDO() {
+    public OfficeConfigDO toOfficeConfigDO(TextEncryptor textEncryptor) {
         OfficeConfigDO officeConfigDO = new OfficeConfigDO();
         officeConfigDO.setDocumentServer(this.documentServer);
         officeConfigDO.setCallbackServer(this.callbackServer);
         officeConfigDO.setFormat(this.format);
         boolean tokenEnabled = StrUtil.isNotBlank(this.secret);
         officeConfigDO.setTokenEnabled(tokenEnabled);
-        if (OfficeConfigService.VO_KEY.equals(this.secret)) {
+        if (Constants.VO_KEY.equals(this.secret)) {
             return officeConfigDO;
         }
         if (tokenEnabled) {
-            String key = OfficeConfigService.generateKey();
-            String encrypted = new SymmetricCrypto(SymmetricAlgorithm.AES, key.getBytes()).encryptHex(this.secret);
-            officeConfigDO.setKey(key);
-            officeConfigDO.setEncrypted(encrypted);
+            officeConfigDO.setSecret(textEncryptor.encrypt(this.secret));
         } else {
-            officeConfigDO.setKey(null);
-            officeConfigDO.setEncrypted(null);
+            officeConfigDO.setSecret(null);
         }
         return officeConfigDO;
     }

@@ -1,15 +1,15 @@
 package com.jmal.clouddisk.model.rbac;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
+import com.jmal.clouddisk.config.Reflective;
 import com.jmal.clouddisk.service.Constants;
 import io.swagger.v3.oas.annotations.media.Schema;
-import lombok.Data;
-import lombok.EqualsAndHashCode;
-import org.springframework.data.annotation.Id;
-
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+
 import java.time.LocalDateTime;
 import java.util.List;
 
@@ -21,9 +21,7 @@ import java.util.List;
 @EqualsAndHashCode(callSuper = true)
 @Schema
 @Valid
-public class ConsumerDTO extends ConsumerBase {
-    @Id
-    String id;
+public class ConsumerDTO extends ConsumerBase implements Reflective {
     @NotNull(message = "用户账号不能为空")
     @Schema(name = "username", title = "用户账号", example = "admin", requiredMode = Schema.RequiredMode.REQUIRED)
     String username;
@@ -40,8 +38,12 @@ public class ConsumerDTO extends ConsumerBase {
     Boolean webpDisabled;
     @Schema(name = "roles", title = "角色Id集合")
     List<String> roles;
+    @Schema(name = "groups", title = "用户组ID列表")
+    List<String> groups;
     @Schema(name = "roleList", title = "角色集合", hidden = true)
     List<RoleDTO> roleList;
+    @Schema(name = "groupList", title = "用户组集合", hidden = true)
+    List<GroupDTO> groupList;
     @Max(value = 1073741824, message = "配额过大")
     @Schema(name = "quota", title = "默认配额, 10G", example = "10")
     Integer quota;
@@ -73,5 +75,9 @@ public class ConsumerDTO extends ConsumerBase {
     @Schema(name = "mfaCode", title = "mfaCode", hidden = true)
     String mfaCode;
 
+    @Schema(name = "mfaSecret", title = "mfaCode", hidden = true)
+    String mfaSecret;
+
+    Personalization personalization;
 
 }

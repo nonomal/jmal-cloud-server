@@ -1,0 +1,50 @@
+package com.jmal.clouddisk.model;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.jmal.clouddisk.config.Reflective;
+import com.jmal.clouddisk.util.StringUtil;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+
+/**
+ * @author jmal
+ */
+@Getter
+@Setter
+@NoArgsConstructor
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class MusicInfo implements Reflective {
+    /***
+     * 歌名
+     */
+    String songName;
+    /***
+     * 歌手
+     */
+    String singer;
+    /***
+     * 专辑
+     */
+    String album;
+
+    public void setSinger(String singer) {
+        this.singer = StringUtil.removeNullChar(singer);
+    }
+
+    public void setAlbum(String album) {
+        this.album = StringUtil.removeNullChar(album);
+    }
+
+    public void setSongName(String songName) {
+        this.songName = StringUtil.removeNullChar(songName);
+    }
+
+    public MusicInfo(Music music) {
+        if (music != null) {
+            setSongName(music.getSongName());
+            setSinger(music.getSinger());
+            setAlbum(music.getAlbum());
+        }
+    }
+}

@@ -1,23 +1,21 @@
 package com.jmal.clouddisk.interceptor;
 
 import cn.hutool.core.text.CharSequenceUtil;
-import com.alibaba.fastjson2.JSON;
+import com.jmal.clouddisk.dao.IAccessTokenDAO;
 import com.jmal.clouddisk.exception.ExceptionType;
 import com.jmal.clouddisk.model.UserAccessTokenDO;
 import com.jmal.clouddisk.model.rbac.UserLoginContext;
-import com.jmal.clouddisk.repository.IAuthDAO;
 import com.jmal.clouddisk.service.IUserService;
+import com.jmal.clouddisk.service.impl.RoleService;
 import com.jmal.clouddisk.service.impl.UserServiceImpl;
-import com.jmal.clouddisk.util.CaffeineUtil;
-import com.jmal.clouddisk.util.ResponseResult;
-import com.jmal.clouddisk.util.ResultUtil;
-import com.jmal.clouddisk.util.TokenUtil;
+import com.jmal.clouddisk.util.*;
 import io.reactivex.rxjava3.core.Completable;
 import io.reactivex.rxjava3.schedulers.Schedulers;
 import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.jetbrains.annotations.NotNull;
 import org.springframework.stereotype.Component;
@@ -26,6 +24,7 @@ import org.springframework.web.context.request.ServletRequestAttributes;
 import org.springframework.web.servlet.HandlerInterceptor;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.util.List;
 
@@ -36,9 +35,12 @@ import java.util.List;
  */
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class AuthInterceptor implements HandlerInterceptor {
 
     public static final String JMAL_TOKEN = "jmal-token";
+
+    public static final String REMEMBER_NAME = "rememberName";
 
     public static final String NAME_HEADER = "name";
 
@@ -49,20 +51,22 @@ public class AuthInterceptor implements HandlerInterceptor {
     private static final int TWO_HOURS_IN_SECONDS = 2 * 60 * 60; // 7200
 
     private static final int SECONDS_IN_DAY = 24 * 60 * 60; // 86400
-    private static final int THIRTY_DAYS_IN_SECONDS = 30 * SECONDS_IN_DAY; // 2592000
+    private static final int NINETY_DAYS_IN_SECONDS = 90 * SECONDS_IN_DAY; // 7776000
 
-    private final IAuthDAO authDAO;
+    private final IAccessTokenDAO accessTokenDAO;
 
     private final UserServiceImpl userService;
 
-    public AuthInterceptor(IAuthDAO authDAO, UserServiceImpl userService) {
-        this.authDAO = authDAO;
-        this.userService = userService;
-    }
+    private final RoleService roleService;
+
 
     @Override
     public boolean preHandle(@NotNull HttpServletRequest request, @NotNull HttpServletResponse response, @NotNull Object handler) {
         // 身份认证
+        return authentication(request, response);
+    }
+
+    public boolean authentication(@NotNull HttpServletRequest request, @NotNull HttpServletResponse response) {
         String username = getUserNameByHeader(request, response);
         if (!CharSequenceUtil.isBlank(username)) {
             // jmal-token 身份认证通过, 设置该身份的权限
@@ -114,7 +118,7 @@ public class AuthInterceptor implements HandlerInterceptor {
     public void setAuthorities(String username) {
         List<String> authorities = CaffeineUtil.getAuthoritiesCache(username);
         if (authorities == null || authorities.isEmpty()) {
-            authorities = userService.getAuthorities(username);
+            authorities = roleService.getAuthorities(username);
             CaffeineUtil.setAuthoritiesCache(username, authorities);
         }
         setAuthorities(username, authorities);
@@ -155,7 +159,7 @@ public class AuthInterceptor implements HandlerInterceptor {
         if (CharSequenceUtil.isBlank(token)) {
             return null;
         }
-        UserAccessTokenDO userAccessTokenDO = authDAO.getUserNameByAccessToken(token);
+        UserAccessTokenDO userAccessTokenDO = accessTokenDAO.getUserNameByAccessToken(token);
         if (userAccessTokenDO == null) {
             return null;
         }
@@ -164,8 +168,10 @@ public class AuthInterceptor implements HandlerInterceptor {
             return null;
         }
         // access-token 认证通过 设置该身份的权限
-        Completable.fromAction(() -> authDAO.updateAccessToken(username, userAccessTokenDO.getAccessToken()))
+        Completable.fromAction(() -> accessTokenDAO.updateAccessToken(username, userAccessTokenDO.getAccessToken()))
                 .subscribeOn(Schedulers.io())
+                .doOnError(e -> log.error(e.getMessage(), e))
+                .onErrorComplete()
                 .subscribe();
         setAuthorities(username);
         return userAccessTokenDO.getUsername();
@@ -209,9 +215,9 @@ public class AuthInterceptor implements HandlerInterceptor {
     private String renewJmalToken(HttpServletRequest request, HttpServletResponse response, String name, String hashPassword, String refreshToken) {
         String username = TokenUtil.getTokenKey(refreshToken, hashPassword);
         if (name.equals(username)) {
-            boolean rememberMe = name.equals(getCookie(request, "rememberName"));
+            boolean rememberMe = Boolean.parseBoolean(getCookie(request, REMEMBER_NAME));
             String jmalToken = generateJmalToken(hashPassword, username);
-            setRefreshCookie(response, hashPassword, username, rememberMe, jmalToken);
+            setRefreshCookie(request, response, hashPassword, username, rememberMe, jmalToken);
             return username;
         }
         return null;
@@ -229,18 +235,10 @@ public class AuthInterceptor implements HandlerInterceptor {
         return renewJmalToken(request, response, username, hashPassword, refreshToken);
     }
 
-    private static void setJmalTokenCookie(HttpServletResponse response, String username, String jmalToken) {
-        Cookie tokenCookie = new Cookie(JMAL_TOKEN, jmalToken);
-        tokenCookie.setMaxAge(TWO_HOURS_IN_SECONDS);
-        tokenCookie.setHttpOnly(true);
-        tokenCookie.setPath("/");
-        response.addCookie(tokenCookie);
+    private static void setJmalTokenCookie(HttpServletRequest request, HttpServletResponse response, String username, String jmalToken) {
 
-        Cookie nameCookie = new Cookie(IUserService.USERNAME, username);
-        nameCookie.setMaxAge(TWO_HOURS_IN_SECONDS);
-        nameCookie.setHttpOnly(true);
-        nameCookie.setPath("/");
-        response.addCookie(nameCookie);
+        addHttpOnlyCookie(request, response, JMAL_TOKEN, jmalToken, TWO_HOURS_IN_SECONDS);
+        addHttpOnlyCookie(request, response, IUserService.USERNAME, username, TWO_HOURS_IN_SECONDS);
 
         response.addHeader(JMAL_TOKEN, jmalToken);
     }
@@ -262,22 +260,42 @@ public class AuthInterceptor implements HandlerInterceptor {
     /**
      * 设置 refreshToken
      *
+     * @param request      HttpServletRequest
      * @param response     HttpServletResponse
      * @param hashPassword hashPassword
      * @param username     username
      * @param rememberMe   rememberMe
      */
-    public static void setRefreshCookie(HttpServletResponse response, String hashPassword, String username, boolean rememberMe, String jmalToken) {
+    public static void setRefreshCookie(HttpServletRequest request, HttpServletResponse response, String hashPassword, String username, boolean rememberMe, String jmalToken) {
         LocalDateTime refreshTokenExpiration = LocalDateTime.now();
-        // 如果用户勾选了记住我, refreshToken期限为30天, 否则为1天
-        int refreshMaxAge = rememberMe ? THIRTY_DAYS_IN_SECONDS : SECONDS_IN_DAY;
+        // 如果用户勾选了记住我, refreshToken期限为90天, 否则为1天
+        int refreshMaxAge = rememberMe ? NINETY_DAYS_IN_SECONDS : SECONDS_IN_DAY;
         refreshTokenExpiration = refreshTokenExpiration.plusSeconds(refreshMaxAge);
-        Cookie refreshCookie = new Cookie(REFRESH_TOKEN, TokenUtil.createToken(username, hashPassword, refreshTokenExpiration));
-        refreshCookie.setMaxAge(refreshMaxAge);
-        refreshCookie.setHttpOnly(true);
-        refreshCookie.setPath("/");
-        response.addCookie(refreshCookie);
-        setJmalTokenCookie(response, username, jmalToken);
+
+        addHttpOnlyCookie(request, response, REFRESH_TOKEN, TokenUtil.createToken(username, hashPassword, refreshTokenExpiration), refreshMaxAge);
+        addHttpOnlyCookie(request, response, REMEMBER_NAME, String.valueOf(rememberMe), refreshMaxAge);
+
+        setJmalTokenCookie(request, response, username, jmalToken);
+    }
+
+    private static void addHttpOnlyCookie(HttpServletRequest request, HttpServletResponse response, String name, String value, int maxAge) {
+
+        String scheme = request.getHeader("X-Forwarded-Proto");
+        if (CharSequenceUtil.isNotBlank(scheme)) {
+            scheme = scheme.split(",")[0].trim();
+        } else {
+            scheme = request.getScheme();
+        }
+        boolean isHttps = "https".equalsIgnoreCase(scheme);
+
+        Cookie cookie = new Cookie(name, value);
+        cookie.setMaxAge(maxAge);
+        cookie.setHttpOnly(true);
+        cookie.setPath("/");
+        cookie.setSecure(isHttps);
+        // SameSite
+        cookie.setAttribute("SameSite", "Strict");
+        response.addCookie(cookie);
     }
 
     public static void removeCookies(HttpServletResponse response, String ...keys) {
@@ -304,22 +322,20 @@ public class AuthInterceptor implements HandlerInterceptor {
     private void returnJson(HttpServletResponse response) {
         response.setCharacterEncoding("UTF-8");
         response.setContentType("application/json; charset=utf-8");
-        ServletOutputStream out = null;
-        try {
-            out = response.getOutputStream();
-            ResponseResult<Object> result = ResultUtil.error(ExceptionType.LOGIN_EXCEPTION.getCode(), ExceptionType.LOGIN_EXCEPTION.getMsg());
-            out.write(JSON.toJSONString(result).getBytes());
-            removeCookies(response, IUserService.USERNAME, AuthInterceptor.JMAL_TOKEN);
+        ResponseResult<Object> result = ResultUtil.error(
+                ExceptionType.LOGIN_EXCEPTION.getCode(),
+                ExceptionType.LOGIN_EXCEPTION.getMsg()
+        );
+        String json = JacksonUtil.toJSONString(result);
+
+        try (ServletOutputStream out = response.getOutputStream()) {
+            out.write(json.getBytes(StandardCharsets.UTF_8));
+            out.flush();
         } catch (IOException e) {
-            log.error(e.getMessage(), e);
+            log.error("Failed to write JSON response", e);
+            response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
         } finally {
-            try {
-                if (out != null) {
-                    out.flush();
-                }
-            } catch (IOException e) {
-                log.error(e.getMessage(), e);
-            }
+            removeCookies(response, IUserService.USERNAME, AuthInterceptor.JMAL_TOKEN);
         }
     }
 }

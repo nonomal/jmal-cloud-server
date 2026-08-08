@@ -3,21 +3,31 @@ package com.jmal.clouddisk.controller.rest;
 import cn.hutool.core.text.CharSequenceUtil;
 import com.jmal.clouddisk.annotation.LogOperatingFun;
 import com.jmal.clouddisk.annotation.Permission;
-import com.jmal.clouddisk.model.*;
+import com.jmal.clouddisk.model.ArticleDTO;
+import com.jmal.clouddisk.model.ArticleParamDTO;
+import com.jmal.clouddisk.model.LogOperation;
+import com.jmal.clouddisk.model.UploadApiParamDTO;
+import com.jmal.clouddisk.model.UploadImageDTO;
+import com.jmal.clouddisk.model.file.FileDocument;
 import com.jmal.clouddisk.oss.web.WebOssService;
-import com.jmal.clouddisk.service.IFileService;
 import com.jmal.clouddisk.service.IMarkdownService;
 import com.jmal.clouddisk.service.IUserService;
+import com.jmal.clouddisk.service.impl.CommonFileService;
 import com.jmal.clouddisk.util.CaffeineUtil;
 import com.jmal.clouddisk.util.ResponseResult;
 import com.jmal.clouddisk.util.ResultUtil;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.servlet.http.HttpServletRequest;
-import org.springframework.beans.factory.annotation.Autowired;
+import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Controller;
 import org.springframework.validation.annotation.Validated;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -30,19 +40,16 @@ import java.util.Arrays;
 @Controller
 @Tag(name = "markdown管理")
 @RestController
+@RequiredArgsConstructor
 public class MarkDownController {
 
-    @Autowired
-    private IMarkdownService markdownService;
+    private final IMarkdownService markdownService;
 
-    @Autowired
-    private WebOssService webOssService;
+    private final WebOssService webOssService;
 
-    @Autowired
-    private IFileService fileService;
+    private final CommonFileService commonFileService;
 
-    @Autowired
-    private IUserService userService;
+    private final IUserService userService;
 
     @Operation(summary = "获取markdown内容")
     @GetMapping("/markdown/p")
@@ -85,9 +92,10 @@ public class MarkDownController {
     @PostMapping("/markdown/edit1")
     @Permission("cloud:file:update")
     public ResponseResult<Object> editTextByPath(@RequestBody UploadApiParamDTO upload) {
-        ResultUtil.checkParamIsNull(upload.getUsername(), upload.getUserId(), upload.getRelativePath(), upload.getContentText());
+        ResultUtil.checkParamIsNull(upload.getUsername(), upload.getUserId(), upload.getRelativePath(),
+                upload.getContentText());
         if (!CharSequenceUtil.isBlank(upload.getMountFileId())) {
-            FileDocument fileDocument = fileService.getById(upload.getMountFileId());
+            FileDocument fileDocument = commonFileService.getById(upload.getMountFileId());
             upload.setUserId(fileDocument.getUserId());
             upload.setUsername(userService.getUserNameById(fileDocument.getUserId()));
             upload.setRelativePath(fileDocument.getPath() + fileDocument.getName());
@@ -106,7 +114,7 @@ public class MarkDownController {
     @PostMapping("/upload-markdown-image")
     @Permission("cloud:file:upload")
     public ResponseResult<Object> uploadMarkdownImage(UploadImageDTO upload) {
-        if(CharSequenceUtil.isBlank(upload.getUserId()) || CharSequenceUtil.isBlank(upload.getUsername())) {
+        if (CharSequenceUtil.isBlank(upload.getUserId()) || CharSequenceUtil.isBlank(upload.getUsername())) {
             return ResultUtil.warning("参数里缺少 userId 或 username");
         }
         return markdownService.uploadMarkdownImage(upload);
@@ -116,18 +124,19 @@ public class MarkDownController {
     @PostMapping("/upload-markdown-link-image")
     @Permission("cloud:file:upload")
     @LogOperatingFun
-    public ResponseResult<Object> uploadMarkdownLinkImage(HttpServletRequest request, @RequestBody UploadImageDTO uploadImageDTO) {
+    public ResponseResult<Object> uploadMarkdownLinkImage(HttpServletRequest request,
+            @RequestBody UploadImageDTO uploadImageDTO) {
         String userId = uploadImageDTO.getUserId();
         String username = uploadImageDTO.getUsername();
-        if(CharSequenceUtil.isBlank(userId)){
+        if (CharSequenceUtil.isBlank(userId)) {
             userId = request.getHeader("userId");
             uploadImageDTO.setUserId(userId);
         }
-        if(CharSequenceUtil.isBlank(username)){
+        if (CharSequenceUtil.isBlank(username)) {
             username = request.getHeader("username");
             uploadImageDTO.setUsername(username);
         }
-        if(CharSequenceUtil.isBlank(userId) || CharSequenceUtil.isBlank(username)) {
+        if (CharSequenceUtil.isBlank(userId) || CharSequenceUtil.isBlank(username)) {
             return ResultUtil.warning("请求头里或参数里必须含有userId和username");
         }
         return markdownService.uploadMarkdownLinkImage(uploadImageDTO);

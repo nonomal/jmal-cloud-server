@@ -1,7 +1,9 @@
 package com.jmal.clouddisk.model;
 
-import cn.hutool.core.util.URLUtil;
 import com.fasterxml.jackson.annotation.JsonFormat;
+import com.jmal.clouddisk.config.Reflective;
+import com.jmal.clouddisk.service.Constants;
+import com.jmal.clouddisk.util.FileNameUtils;
 import io.swagger.v3.oas.annotations.media.Schema;
 
 import lombok.Data;
@@ -19,7 +21,7 @@ import java.time.LocalDateTime;
 @Schema
 @Data
 @Valid
-public class ArticleParamDTO {
+public class ArticleParamDTO implements Reflective {
 
     @NotNull(message = "userId不能为空")
     String userId;
@@ -29,9 +31,9 @@ public class ArticleParamDTO {
     String filename;
     String fileId;
     @NotNull(message = "contentText不能为空")
-    @Schema(name = "contentText", title = "markdown内容", required = true)
+    @Schema(name = Constants.CONTENT_TEXT, title = "markdown内容", requiredMode = Schema.RequiredMode.REQUIRED)
     String contentText;
-    @Schema(name = "html", title = "html内容")
+    @Schema(name = Constants.CONTENT_HTML, title = "html内容")
     String html;
     @Schema(name = "currentDirectory", title = "当前目录,用户的网盘目录,如果为空则为'/'")
     String currentDirectory;
@@ -59,13 +61,13 @@ public class ArticleParamDTO {
     private LocalDateTime uploadDate;
 
     public String getFilename() {
-        return URLUtil.decode(filename);
+        return FileNameUtils.decodeAndCheckPath(filename);
     }
 
     public String getCurrentDirectory() {
         if (currentDirectory == null || "undefined".equals(currentDirectory)) {
             return null;
         }
-        return URLUtil.decode(currentDirectory);
+        return FileNameUtils.decodeAndCheckPath(currentDirectory);
     }
 }

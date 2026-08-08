@@ -8,7 +8,7 @@ import com.drew.metadata.exif.ExifIFD0Directory;
 import com.drew.metadata.exif.ExifSubIFDDescriptor;
 import com.drew.metadata.exif.ExifSubIFDDirectory;
 import com.drew.metadata.exif.GpsDirectory;
-import com.jmal.clouddisk.model.ExifInfo;
+import com.jmal.clouddisk.model.file.ExifInfo;
 import com.jmal.clouddisk.service.Constants;
 import lombok.extern.slf4j.Slf4j;
 
@@ -20,7 +20,11 @@ import java.util.TimeZone;
 public class ImageExifUtil {
 
     public static boolean isImageType(String contentType, String suffix) {
-        return contentType.startsWith(Constants.CONTENT_TYPE_IMAGE) && (!"ico".equals(suffix) && !"svg".equals(suffix));
+        return contentType.startsWith(Constants.CONTENT_TYPE_IMAGE) && needToHandle(suffix);
+    }
+
+    public static boolean needToHandle(String suffix) {
+        return (!"ico".equals(suffix) && !"svg".equals(suffix));
     }
 
     public static ExifInfo getExif(File file) {
@@ -118,7 +122,7 @@ public class ImageExifUtil {
             return exifInfo;
         } catch (Exception e) {
             // 获取图片EXIF信息失败
-            log.warn("获取图片EXIF信息失败: {}, {}", e.getMessage(), file);
+            log.debug("获取图片EXIF信息失败: {}, {}", e.getMessage(), file);
         }
         return exifInfo;
     }

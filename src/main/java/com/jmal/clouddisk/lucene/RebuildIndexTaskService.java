@@ -1,44 +1,57 @@
 package com.jmal.clouddisk.lucene;
 
+import cn.hutool.core.convert.Convert;
 import cn.hutool.core.date.TimeInterval;
 import cn.hutool.core.thread.ThreadUtil;
 import cn.hutool.core.util.NumberUtil;
-import cn.hutool.core.util.ReUtil;
 import cn.hutool.core.util.StrUtil;
 import com.jmal.clouddisk.config.FileProperties;
-import com.jmal.clouddisk.model.FileDocument;
+import com.jmal.clouddisk.dao.IFileDAO;
+import com.jmal.clouddisk.model.file.dto.FileBaseDTO;
 import com.jmal.clouddisk.ocr.OcrService;
+import com.jmal.clouddisk.service.Constants;
 import com.jmal.clouddisk.service.impl.CommonFileService;
+import com.jmal.clouddisk.service.impl.CommonUserFileService;
+import com.jmal.clouddisk.service.impl.CommonUserService;
 import com.jmal.clouddisk.service.impl.MenuService;
+import com.jmal.clouddisk.service.impl.MessageService;
+import com.jmal.clouddisk.service.impl.PathService;
 import com.jmal.clouddisk.service.impl.RoleService;
-import com.jmal.clouddisk.service.impl.UserServiceImpl;
 import com.jmal.clouddisk.util.ResponseResult;
 import com.jmal.clouddisk.util.ResultUtil;
 import com.jmal.clouddisk.util.ThrottleExecutor;
-import jakarta.annotation.PostConstruct;
+import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.schedulers.Schedulers;
 import jakarta.annotation.PreDestroy;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.search.PrefixQuery;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
-import org.springframework.data.mongodb.core.MongoTemplate;
-import org.springframework.data.mongodb.core.query.Criteria;
-import org.springframework.data.mongodb.core.query.Query;
-import org.springframework.data.mongodb.core.query.Update;
+import org.springframework.context.ApplicationListener;
+import org.springframework.context.event.ContextRefreshedEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
 import java.math.RoundingMode;
-import java.nio.file.*;
+import java.nio.file.FileVisitOption;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.util.*;
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -53,7 +66,9 @@ import java.util.concurrent.locks.ReentrantLock;
 @Service
 @Slf4j
 @RequiredArgsConstructor
-public class RebuildIndexTaskService {
+public class RebuildIndexTaskService implements ApplicationListener<RebuildIndexEvent> {
+
+    private final PathService pathService;
 
     private final IndexWriter indexWriter;
 
@@ -61,21 +76,27 @@ public class RebuildIndexTaskService {
 
     private final RoleService roleService;
 
-    private final UserServiceImpl userService;
+    private final CommonUserService commonUserService;
 
     private final FileProperties fileProperties;
 
     private final CommonFileService commonFileService;
 
-    private final MongoTemplate mongoTemplate;
+    private final CommonUserFileService commonUserFileService;
 
-    private ExecutorService syncFileVisitorService;
+    private final MessageService messageService;
+
+    private final IFileDAO fileDAO;
+
+    private final ThrottledTaskExecutor syncFileVisitorService = new ThrottledTaskExecutor(Constants.MAX_CONCURRENT_PROCESSING_NUMBER);
 
     private SyncFileVisitor syncFileVisitor;
 
     private double totalCount;
 
     private final OcrService ocrService;
+
+    private final LuceneReconciliationService luceneReconciliationService;
 
     /**
      * 接收消息的用户
@@ -93,10 +114,14 @@ public class RebuildIndexTaskService {
      */
     private static final AtomicInteger INDEXED_TASK_SIZE = new AtomicInteger(0);
 
+    private static final long SCAN_TERMINATION_TIMEOUT_MINUTES = 60;
+
     /**
      * 同步文件操作锁, 防止重复操作
      */
     private static final ReentrantLock SYNC_FILE_LOCK = new ReentrantLock();
+
+    private Runnable syncCompleteCallback;
 
     /**
      * 进度百分比
@@ -117,34 +142,46 @@ public class RebuildIndexTaskService {
 
     private final ReentrantLock deleteDocWithDeleteFlagLock = new ReentrantLock();
 
-    @PostConstruct
+    @EventListener(ContextRefreshedEvent.class)
+    public void onApplicationReady(ContextRefreshedEvent event) {
+        if (event.getApplicationContext().getParent() != null) {
+            return;
+        }
+        ThreadUtil.execute(this::init);
+    }
+
     public void init() {
         // 启动时检测是否存在菜单，不存在则初始化
         if (!menuService.existsMenu()) {
-            menuService.initMenus();
             roleService.initRoles();
         }
+        menuService.initMenus();
         // 启动时检测是否存在lucene索引，不存在则初始化
         if (!checkIndexExists()) {
-            doSync(userService.getCreatorUsername(), null);
+            doSync(commonUserService.getCreatorUsername(), null, true);
         }
         // 重置索引状态
         resetIndexStatus();
     }
 
-    private void getSyncFileVisitorService() {
-        int processors = Runtime.getRuntime().availableProcessors() - 4;
-        if (syncFileVisitorService == null || syncFileVisitorService.isShutdown()) {
-            syncFileVisitorService = ThreadUtil.newFixedExecutor(Math.max(processors, 2), 1, "syncFileVisitor", true);
+
+    @Override
+    public void onApplicationEvent(RebuildIndexEvent event) {
+        if (event.getUsername() != null && event.getFileAbsolutePath() != null) {
+            doSync(event.getUsername(), event.getFileAbsolutePath(), false);
         }
     }
 
-    public void doSync(String username, String path) {
+    public void doSync(String username, String path, boolean isDelIndex) {
         if (isSyncFile() || isIndexing()) {
             return;
         }
+        if (StrUtil.isBlank(username)) {
+            username = commonUserService.getCreatorUsername();
+        }
         setPercentMap(0d, 0d);
-        ThreadUtil.execute(() -> {
+        String finalUsername = username;
+        Completable.fromAction(() -> {
             if (!SYNC_FILE_LOCK.tryLock()) {
                 return;
             }
@@ -158,14 +195,16 @@ public class RebuildIndexTaskService {
                 if (!Files.exists(canPath)) {
                     return;
                 }
-                getSyncFileVisitorService();
-                rebuildingIndex(username, canPath);
+                rebuildingIndex(finalUsername, canPath, isDelIndex);
             } finally {
                 SYNC_FILE_LOCK.unlock();
                 setPercentMap(100d, 100d);
                 pushMessage();
             }
-        });
+        }).subscribeOn(Schedulers.io())
+                .doOnError(e -> log.error(e.getMessage(), e))
+                .onErrorComplete()
+                .subscribe();
     }
 
     /**
@@ -173,8 +212,9 @@ public class RebuildIndexTaskService {
      *
      * @param recipient 接收消息的用户
      * @param path      要扫描的路径
+     * @param isDelIndex 是否删除索引
      */
-    private void rebuildingIndex(String recipient, Path path) {
+    private void rebuildingIndex(String recipient, Path path, boolean isDelIndex) {
         TimeInterval timeInterval = new TimeInterval();
         try {
             getRecipient(recipient);
@@ -187,13 +227,13 @@ public class RebuildIndexTaskService {
             // 先移除删除标记, 以免因为扫描路径的不同导致删除标记未移除
             removeDeletedFlag(null);
             // 添加删除标记, 扫描完后如果标记还在则删除
-            addDeleteFlagOfDoc(path);
+            addDeleteFlagOfDoc(path, isDelIndex);
             // 重置索引状态
             resetIndexStatus();
             FileCountVisitor fileCountVisitor = new FileCountVisitor();
             Files.walkFileTree(path, fileVisitOptions, Integer.MAX_VALUE, fileCountVisitor);
             totalCount = fileCountVisitor.getCount();
-            log.info("path: {}, 开始同步, 文件数: {}", path, totalCount);
+            log.info("path: {}, 开始扫描, 文件数: {}", path, totalCount);
             timeInterval.start();
             if (syncFileVisitor == null) {
                 syncFileVisitor = new SyncFileVisitor(totalCount);
@@ -207,43 +247,22 @@ public class RebuildIndexTaskService {
         } finally {
             setPercentMap(100d, getIndexedPercentValue());
             syncFileVisitor = null;
-            log.info("同步完成, 耗时: {}s", timeInterval.intervalSecond());
-        }
-    }
-
-    /**
-     * 删除path下的所有索引
-     * @param path path
-     */
-    private void deleteAllIndex(String path) {
-        if (StrUtil.isBlank(path)) {
-            path = "/";
-        }
-        // 查询path下的所有索引
-        Term prefixTerm = new Term("path", path);
-        PrefixQuery prefixQuery = new PrefixQuery(prefixTerm);
-        try {
-            indexWriter.deleteDocuments(prefixQuery);
-            indexWriter.commit();
-        } catch (IOException e) {
-            log.error(e.getMessage(), e);
+            log.info("扫描完成, 耗时: {}s", Convert.toDouble(timeInterval.intervalMs() / 1000));
         }
     }
 
     private void waitTaskCompleted() {
         try {
-            log.info("等待同步文件完成");
-            syncFileVisitorService.shutdown();
+            log.info("等待扫描文件完成");
             // 等待线程池里所有任务完成
-            if (!syncFileVisitorService.awaitTermination(10, TimeUnit.MINUTES)) {
-                log.warn("同步文件超时, 尝试强制停止所有任务");
+            if (!syncFileVisitorService.awaitTermination(SCAN_TERMINATION_TIMEOUT_MINUTES, TimeUnit.MINUTES)) {
+                log.warn("扫描文件超时, 尝试强制停止所有任务");
                 // 移除删除标记, 以免误删索引
                 removeDeletedFlag(null);
-                syncFileVisitorService.shutdownNow();
             }
         } catch (InterruptedException e) {
-            syncFileVisitorService.shutdownNow();
             Thread.currentThread().interrupt();
+            log.error(e.getMessage(), e);
         }
     }
 
@@ -272,12 +291,19 @@ public class RebuildIndexTaskService {
         }, 10000);
     }
 
+    public void onSyncComplete(Runnable callback) {
+        this.syncCompleteCallback = callback;
+    }
+
     public void rebuildingIndexCompleted() {
         if (!hasUnIndexedTasks() && NOT_INDEX_TASK_SIZE.get() > 0) {
             setPercentMap(100d, 100d);
             log.debug("重建索引完成, INDEXED_TASK_SIZE, {}, NOT_INDEX_TASK_SIZE: {}", INDEXED_TASK_SIZE, NOT_INDEX_TASK_SIZE);
             restIndexedTasks();
             pushMessage();
+            if (syncCompleteCallback != null) {
+                syncCompleteCallback.run();
+            }
         }
     }
 
@@ -308,6 +334,7 @@ public class RebuildIndexTaskService {
                 throttleExecutor = new ThrottleExecutor(10000);
             }
         }
+        throttleExecutor.cancel();
         throttleExecutor.schedule(this::rebuildingIndexCompleted);
     }
 
@@ -334,12 +361,13 @@ public class RebuildIndexTaskService {
      * 把文件同步到数据库
      * @param username 用户名
      * @param path 文件相对路径
+     * @param isDelIndex 是否删除索引
      */
-    public ResponseResult<Object> sync(String username, String path) {
+    public ResponseResult<Object> sync(String username, String path, boolean isDelIndex) {
         if (StrUtil.isNotBlank(path)) {
             path = Paths.get(fileProperties.getRootDir(), username, path).toString();
         }
-        doSync(username, path);
+        doSync(username, path, isDelIndex);
         return ResultUtil.success();
     }
 
@@ -361,7 +389,7 @@ public class RebuildIndexTaskService {
             return;
         }
         if (getRecipient(null) == null) {
-            getRecipient(userService.getCreatorUsername());
+            getRecipient(commonUserService.getCreatorUsername());
         }
         // 更新进度
         updatePercent();
@@ -374,7 +402,11 @@ public class RebuildIndexTaskService {
         if (syncFileVisitor == null) {
             return PERCENT_MAP.getOrDefault(SYNC_PERCENT, 100d);
         }
-        return syncFileVisitor.getPercent();
+        double percent = syncFileVisitor.getPercent();
+        if (percent > 100) {
+            return 100;
+        }
+        return percent;
     }
 
     /**
@@ -384,7 +416,11 @@ public class RebuildIndexTaskService {
         if (NOT_INDEX_TASK_SIZE.get() == 0 || isSyncFile()) {
             return 100;
         }
-        return getIndexedPercentValue();
+        double percent = getIndexedPercentValue();
+        if (percent > 100) {
+            return 100;
+        }
+        return percent;
     }
 
     private double getIndexedPercentValue() {
@@ -393,7 +429,6 @@ public class RebuildIndexTaskService {
         }
         return NumberUtil.round((double) INDEXED_TASK_SIZE.get() / totalCount * 100, 2, RoundingMode.DOWN).doubleValue();
     }
-
 
     private class SyncFileVisitor extends SimpleFileVisitor<Path> {
 
@@ -424,7 +459,7 @@ public class RebuildIndexTaskService {
             // 跳过临时文件目录
             FileVisitResult skipTempDirectory = skipTempDirectory(dir);
             if (skipTempDirectory != null) return skipTempDirectory;
-            String username = commonFileService.getUsernameByAbsolutePath(dir);
+            String username = pathService.getUsernameByAbsolutePath(dir);
             processCount.incrementAndGet();
             if (StrUtil.isBlank(username)) {
                 return super.visitFile(dir, attrs);
@@ -437,12 +472,13 @@ public class RebuildIndexTaskService {
         @Override
         public FileVisitResult visitFile(Path file, @NotNull BasicFileAttributes attrs) throws IOException {
             // 判断文件名是否在monitorIgnoreFilePrefix中
-            if (fileProperties.getMonitorIgnoreFilePrefix().stream().anyMatch(file.getFileName()::startsWith)) {
+            String filename = file.getFileName().toString();
+            if (fileProperties.getMonitorIgnoreFilePrefix().stream().anyMatch(filename::startsWith)) {
                 log.debug("忽略文件:{}", file.getFileName());
                 return super.visitFile(file, attrs);
             }
             processCount.incrementAndGet();
-            String username = commonFileService.getUsernameByAbsolutePath(file);
+            String username = pathService.getUsernameByAbsolutePath(file);
             if (StrUtil.isBlank(username)) {
                 return super.visitFile(file, attrs);
             }
@@ -451,21 +487,19 @@ public class RebuildIndexTaskService {
         }
 
         private void processFile(Path file, String username) {
-            // 使用 RxJava 执行异步文件创建
             syncFileVisitorService.execute(() -> createFile(username, file));
         }
 
         private void createFile(String username, Path file) {
             try {
-                commonFileService.createFile(username, file.toFile(), null, null);
+                commonUserFileService.createFile(username, file.toFile(), null, null);
             } catch (Exception e) {
                 log.error("createFile error {}{}", e.getMessage(), file, e);
-                Query query = new Query();
-                query.fields().include("_id");
-                FileDocument fileDocument = commonFileService.getFileDocument(username, file.toFile().getAbsolutePath(), query);
-                if (fileDocument != null) {
+                FileBaseDTO fileBaseDTO = commonFileService.getFileBaseDTO(username, file.toFile().getAbsolutePath());
+                String fileId = fileDAO.findIdByUserIdAndPathAndName(fileBaseDTO.getUserId(), fileBaseDTO.getName(), fileBaseDTO.getPath());
+                if (fileId != null) {
                     // 需要移除删除标记
-                    removeDeletedFlag(Collections.singletonList(fileDocument.getId()));
+                    removeDeletedFlag(Collections.singletonList(fileId));
                 }
             }
         }
@@ -486,7 +520,7 @@ public class RebuildIndexTaskService {
     }
 
     private void pushMessage() {
-        commonFileService.pushMessage(getRecipient(null), PERCENT_MAP, RebuildIndexTaskService.MSG_SYNCED);
+        messageService.pushMessage(getRecipient(null), PERCENT_MAP, RebuildIndexTaskService.MSG_SYNCED);
         log.debug("索引进度: {}, isSyncFile: {}, INDEXED_TASK_SIZE, {}, NOT_INDEX_TASK_SIZE: {}", PERCENT_MAP, isSyncFile(), INDEXED_TASK_SIZE.get(), NOT_INDEX_TASK_SIZE.get());
     }
 
@@ -503,7 +537,7 @@ public class RebuildIndexTaskService {
             // 跳过临时文件目录
             FileVisitResult skipTempDirectory = skipTempDirectory(dir);
             if (skipTempDirectory != null) return skipTempDirectory;
-            String username = commonFileService.getUsernameByAbsolutePath(dir);
+            String username = pathService.getUsernameByAbsolutePath(dir);
             count.addAndGet(1);
             if (StrUtil.isBlank(username)) {
                 return super.visitFile(dir, attrs);
@@ -521,20 +555,22 @@ public class RebuildIndexTaskService {
 
     private @Nullable FileVisitResult skipTempDirectory(Path dir) {
         // 跳过临时文件目录
-        if (dir.toFile().getName().equals(fileProperties.getChunkFileDir())) {
+        if (dir.startsWith(Paths.get(fileProperties.getRootDir(), fileProperties.getChunkFileDir()))) {
             return FileVisitResult.SKIP_SUBTREE;
         }
         // 跳过lucene索引目录
-        if (dir.toFile().getName().equals(fileProperties.getLuceneIndexDir())) {
+        if (dir.startsWith(Paths.get(fileProperties.getRootDir(), fileProperties.getLuceneIndexDir()))) {
+            return FileVisitResult.SKIP_SUBTREE;
+        }
+        // 跳过 jmalcloud 目录
+        if (dir.startsWith(Paths.get(fileProperties.getRootDir(), fileProperties.getJmalcloudDBDir()))) {
             return FileVisitResult.SKIP_SUBTREE;
         }
         return null;
     }
 
     public boolean checkIndexExists() {
-        org.springframework.data.mongodb.core.query.Query query = new org.springframework.data.mongodb.core.query.Query();
-        query.addCriteria(Criteria.where("ossFolder").exists(true));
-        long count = mongoTemplate.count(query, CommonFileService.COLLECTION_NAME);
+        long count = fileDAO.countOssFolder();
         long indexCount = indexWriter.getDocStats().numDocs;
         return indexCount > count;
     }
@@ -543,27 +579,20 @@ public class RebuildIndexTaskService {
      * 重置索引状态, 将正在索引的文件状态重置为未索引
      */
     public void resetIndexStatus() {
-        org.springframework.data.mongodb.core.query.Query query = new org.springframework.data.mongodb.core.query.Query();
-        query.addCriteria(Criteria.where(LuceneService.MONGO_INDEX_FIELD).lte(IndexStatus.INDEXING.getStatus()));
-        Update update = new Update();
-        update.unset(LuceneService.MONGO_INDEX_FIELD);
-        mongoTemplate.updateMulti(query, update, CommonFileService.COLLECTION_NAME);
+        fileDAO.resetIndexStatus();
     }
 
     /**
      * 检查是否有未索引或正在索引的任务
      */
     public boolean hasUnIndexedTasks() {
-        org.springframework.data.mongodb.core.query.Query query = new org.springframework.data.mongodb.core.query.Query();
-        query.addCriteria(Criteria.where(LuceneService.MONGO_INDEX_FIELD).lte(IndexStatus.INDEXING.getStatus()));
-        long count = mongoTemplate.count(query, CommonFileService.COLLECTION_NAME);
-        return count > 0;
+        return fileDAO.existsByUnIndexed();
     }
 
     /**
      * 添加删除标记
      */
-    private void addDeleteFlagOfDoc(Path filepath) {
+    private void addDeleteFlagOfDoc(Path filepath, boolean isDelIndex) {
         if (filepath == null) {
             return;
         }
@@ -573,11 +602,11 @@ public class RebuildIndexTaskService {
         if (filepath.toFile().isFile()) {
             return;
         }
-        String username = commonFileService.getUsernameByAbsolutePath(filepath);
+        String username = pathService.getUsernameByAbsolutePath(filepath);
         String userId = null;
         String path = null;
         if (StrUtil.isNotBlank(username)) {
-            userId = userService.getUserIdByUserName(username);
+            userId = commonUserService.getUserIdByUserName(username);
             Path relativePath = Paths.get(fileProperties.getRootDir(), username).relativize(filepath);
             if (relativePath.getNameCount() > 0) {
                 path = "/" + relativePath + "/";
@@ -585,22 +614,11 @@ public class RebuildIndexTaskService {
                 path = "/";
             }
         }
-        org.springframework.data.mongodb.core.query.Query query = new org.springframework.data.mongodb.core.query.Query();
-        query.addCriteria(Criteria.where("alonePage").exists(false));
-        query.addCriteria(Criteria.where("release").exists(false));
-        query.addCriteria(Criteria.where("mountFileId").exists(false));
-        if (StrUtil.isNotBlank(userId)) {
-            query.addCriteria(Criteria.where("userId").is(userId));
+        fileDAO.setDelTag(userId, path);
+        if (isDelIndex) {
+            // 开启索引对账, 删除孤儿索引
+            luceneReconciliationService.startReconciliation();
         }
-        if (StrUtil.isNotBlank(path)) {
-            query.addCriteria(Criteria.where("path").regex("^" + ReUtil.escape(path)));
-        }
-        Update update = new Update();
-        // 添加删除标记用于在之后删除
-        update.set("delete", 1);
-        mongoTemplate.updateMulti(query, update, CommonFileService.COLLECTION_NAME);
-        // 删除索引
-        deleteAllIndex(path);
     }
 
     /**
@@ -609,22 +627,12 @@ public class RebuildIndexTaskService {
      * @param fileIdList fileIdList
      */
     public void removeDeletedFlag(List<String> fileIdList) {
-        org.springframework.data.mongodb.core.query.Query query = new org.springframework.data.mongodb.core.query.Query();
-        if (fileIdList == null || fileIdList.isEmpty()) {
-            query.addCriteria(Criteria.where("delete").is(1));
-        } else {
-            query.addCriteria(Criteria.where("_id").in(fileIdList).and("delete").is(1));
-        }
-        Update update = new Update();
-        update.unset("delete");
-        mongoTemplate.updateMulti(query, update, CommonFileService.COLLECTION_NAME);
+        fileDAO.UnsetDelTagByIdIn(fileIdList);
     }
 
     @PreDestroy
     public void destroy() {
-        if (syncFileVisitorService != null) {
-            syncFileVisitorService.shutdown();
-        }
+        syncFileVisitorService.shutdown();
         if (throttleExecutor != null) {
             throttleExecutor.shutdown();
         }

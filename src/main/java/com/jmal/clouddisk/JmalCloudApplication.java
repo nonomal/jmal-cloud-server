@@ -1,11 +1,12 @@
 package com.jmal.clouddisk;
 
 import cn.hutool.crypto.SecureUtil;
-import com.jmal.clouddisk.util.TesseractUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
+import org.springframework.data.mongodb.repository.config.EnableMongoRepositories;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
@@ -17,16 +18,14 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 @EnableCaching
 @EnableScheduling
 @Slf4j
+
+@EnableMongoRepositories(basePackages = "com.jmal.clouddisk.dao.impl.mongodb")
+@EnableJpaRepositories(basePackages = "com.jmal.clouddisk.dao.impl.jpa")
 public class JmalCloudApplication {
 
     public static void main(String[] args) {
         SecureUtil.disableBouncyCastle();
         SpringApplication application = new SpringApplication(JmalCloudApplication.class);
-        // 允许循环引用
-        application.setAllowCircularReferences(true);
-
-        // dev环境下设置tesseract的lib路径
-        TesseractUtil.setTesseractLibPath();
 
         application.run(args);
     }

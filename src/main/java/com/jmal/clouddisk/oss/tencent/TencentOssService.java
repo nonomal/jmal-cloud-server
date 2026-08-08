@@ -1,11 +1,22 @@
 package com.jmal.clouddisk.oss.tencent;
 
+import cn.hutool.core.date.LocalDateTimeUtil;
 import cn.hutool.core.io.file.PathUtil;
+import cn.hutool.core.text.CharSequenceUtil;
 import cn.hutool.core.thread.ThreadUtil;
 import com.aliyun.oss.ClientException;
 import com.aliyun.oss.OSSException;
 import com.jmal.clouddisk.config.FileProperties;
-import com.jmal.clouddisk.oss.*;
+import com.jmal.clouddisk.exception.CommonException;
+import com.jmal.clouddisk.model.GridFSBO;
+import com.jmal.clouddisk.model.Metadata;
+import com.jmal.clouddisk.oss.AbstractOssObject;
+import com.jmal.clouddisk.oss.BaseOssService;
+import com.jmal.clouddisk.oss.FileInfo;
+import com.jmal.clouddisk.oss.IOssService;
+import com.jmal.clouddisk.oss.PartInfo;
+import com.jmal.clouddisk.oss.PlatformOSS;
+import com.jmal.clouddisk.oss.S3ObjectSummary;
 import com.jmal.clouddisk.oss.web.model.OssConfigDTO;
 import com.qcloud.cos.COSClient;
 import com.qcloud.cos.ClientConfig;
@@ -14,21 +25,52 @@ import com.qcloud.cos.auth.COSCredentials;
 import com.qcloud.cos.exception.CosClientException;
 import com.qcloud.cos.http.HttpMethodName;
 import com.qcloud.cos.http.HttpProtocol;
-import com.qcloud.cos.model.*;
+import com.qcloud.cos.model.AbortMultipartUploadRequest;
+import com.qcloud.cos.model.COSObject;
+import com.qcloud.cos.model.COSObjectSummary;
+import com.qcloud.cos.model.COSVersionSummary;
+import com.qcloud.cos.model.CompleteMultipartUploadRequest;
+import com.qcloud.cos.model.CopyObjectRequest;
+import com.qcloud.cos.model.DeleteObjectsRequest;
+import com.qcloud.cos.model.GeneratePresignedUrlRequest;
+import com.qcloud.cos.model.GetObjectRequest;
+import com.qcloud.cos.model.InitiateMultipartUploadRequest;
+import com.qcloud.cos.model.InitiateMultipartUploadResult;
+import com.qcloud.cos.model.ListMultipartUploadsRequest;
+import com.qcloud.cos.model.ListObjectsRequest;
+import com.qcloud.cos.model.ListPartsRequest;
+import com.qcloud.cos.model.ListVersionsRequest;
+import com.qcloud.cos.model.MultipartUpload;
+import com.qcloud.cos.model.MultipartUploadListing;
+import com.qcloud.cos.model.ObjectListing;
+import com.qcloud.cos.model.ObjectMetadata;
+import com.qcloud.cos.model.PartETag;
+import com.qcloud.cos.model.PartListing;
+import com.qcloud.cos.model.PartSummary;
+import com.qcloud.cos.model.PutObjectRequest;
+import com.qcloud.cos.model.PutObjectResult;
+import com.qcloud.cos.model.StorageClass;
+import com.qcloud.cos.model.UploadPartRequest;
+import com.qcloud.cos.model.VersionListing;
 import com.qcloud.cos.region.Region;
 import com.qcloud.cos.transfer.Copy;
 import com.qcloud.cos.transfer.TransferManager;
 import com.qcloud.cos.transfer.TransferManagerConfiguration;
+import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.schedulers.Schedulers;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
 
 import java.io.ByteArrayInputStream;
-import java.io.File;
 import java.io.InputStream;
-import java.net.URL;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 
@@ -59,7 +101,10 @@ public class TencentOssService implements IOssService {
         this.cosClient = new COSClient(cred, clientConfig);
         scheduledThreadPoolExecutor = ThreadUtil.createScheduledExecutor(1);
         this.baseOssService = new BaseOssService(this, bucketName, fileProperties, scheduledThreadPoolExecutor, ossConfigDTO);
-        ThreadUtil.execute(this::getMultipartUploads);
+        Completable.fromAction(this::getMultipartUploads).subscribeOn(Schedulers.io())
+                .doOnError(e -> log.error(e.getMessage(), e))
+                .onErrorComplete()
+                .subscribe();
         this.transferManager = new TransferManager(cosClient);
         createTransferManager();
     }
@@ -85,6 +130,11 @@ public class TencentOssService implements IOssService {
     }
 
     @Override
+    public Boolean getProxyEnabled() {
+        return baseOssService.getProxyEnabled();
+    }
+
+    @Override
     public FileInfo getFileInfo(String objectName) {
         return baseOssService.getFileInfo(objectName);
     }
@@ -105,6 +155,11 @@ public class TencentOssService implements IOssService {
     }
 
     @Override
+    public boolean write(InputStream inputStream, String ossPath, String objectName, long size) {
+        return uploadFile(inputStream, objectName, size);
+    }
+
+    @Override
     public String[] list(String objectName) {
         return baseOssService.getFileNameList(objectName).toArray(new String[0]);
     }
@@ -116,16 +171,88 @@ public class TencentOssService implements IOssService {
 
     @Override
     public AbstractOssObject getAbstractOssObject(String objectName) {
-        return getAbstractOssObject(objectName, null, null);
+        return getAbstractOssObject(objectName, null, null, null);
+    }
+
+    @Override
+    public AbstractOssObject getAbstractOssObject(String objectName, String versionId) {
+        return getAbstractOssObject(objectName, versionId, null, null);
+    }
+
+    @Override
+    public Page<GridFSBO> listObjectVersions(String objectName, Integer pageSize, Integer pageIndex) {
+
+        List<GridFSBO> allVersions = new ArrayList<>();
+        String nextMarker = null;
+
+        int skipCount = (pageIndex - 1) * pageSize;
+        int totalCount = 0;
+        boolean hasMore = true;
+        String versionIdMarker = null;
+
+        VersionListing versionListing;
+        while (hasMore) {
+            ListVersionsRequest listVersionsRequest = new ListVersionsRequest()
+                    .withBucketName(bucketName)
+                    .withPrefix(objectName)
+                    .withKeyMarker(nextMarker)
+                    .withVersionIdMarker(versionIdMarker);
+            versionListing = cosClient.listVersions(listVersionsRequest);
+            if (!versionListing.getVersionSummaries().isEmpty()) {
+                for (var version : versionListing.getVersionSummaries()) {
+                    if (version.getKey().equals(objectName)) {
+                        totalCount++;
+                        // 跳过前面的页，收集当前页的数据
+                        if (totalCount > skipCount && allVersions.size() < pageSize) {
+                            allVersions.add(getGridFSBO(version));
+                        }
+                    }
+                }
+            }
+            // 检查是否还有更多数据
+            if (versionListing.isTruncated()) {
+                nextMarker = versionListing.getNextKeyMarker();
+                versionIdMarker = versionListing.getNextVersionIdMarker();
+            } else {
+                hasMore = false;
+            }
+
+            // 如果已经收集够当前页的数据，且不需要统计总数，可以提前退出
+            if (allVersions.size() >= pageSize && !versionListing.isTruncated()) {
+                break;
+            }
+        }
+        return new PageImpl<>(allVersions, PageRequest.of(pageIndex - 1, pageSize), totalCount);
+    }
+
+    private static GridFSBO getGridFSBO(COSVersionSummary versionSummary) {
+        String objectName = versionSummary.getKey();
+        String filename = Path.of(objectName).getFileName().toString();
+        GridFSBO gridFSBO = new GridFSBO();
+        gridFSBO.setId(versionSummary.getVersionId());
+        gridFSBO.setUploadDate(LocalDateTimeUtil.of(versionSummary.getLastModified()));
+        Metadata metadata = new Metadata();
+        metadata.setSize(versionSummary.getSize());
+        metadata.setFilename(filename);
+        metadata.setTime(LocalDateTimeUtil.format(gridFSBO.getUploadDate(), "yyyy-MM-dd HH:mm:ss"));
+        gridFSBO.setMetadata(metadata);
+        return gridFSBO;
     }
 
     @Override
     public AbstractOssObject getAbstractOssObject(String objectName, Long rangeStart, Long rangeEnd) {
+        return getAbstractOssObject(objectName, null, rangeStart, rangeEnd);
+    }
+
+    private AbstractOssObject getAbstractOssObject(String objectName, String versionId, Long rangeStart, Long rangeEnd) {
         COSObject ossObject = null;
         try {
             GetObjectRequest getObjectRequest = new GetObjectRequest(bucketName, objectName);
             if (rangeStart != null && rangeEnd != null) {
                 getObjectRequest.setRange(rangeStart, rangeEnd);
+            }
+            if (versionId != null) {
+                getObjectRequest.setVersionId(versionId);
             }
             ossObject = this.cosClient.getObject(getObjectRequest);
         } catch (Exception e) {
@@ -139,15 +266,77 @@ public class TencentOssService implements IOssService {
 
     @Override
     public boolean deleteObject(String objectName) {
+        return deleteObjectVersion(objectName, null);
+    }
+
+    @Override
+    public boolean deleteObject(String objectName, String versionId) {
+        return deleteObjectVersion(objectName, versionId);
+    }
+
+    @Override
+    public void restoreVersion(String objectName, String versionId) {
+        // 复制指定版本到当前版本
+        try {
+            CopyObjectRequest copyObjectRequest = new CopyObjectRequest(region, bucketName, objectName, bucketName, objectName);
+            copyObjectRequest.setSourceVersionId(versionId);
+            cosClient.copyObject(copyObjectRequest);
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            throw new CommonException(e.getMessage());
+        }
+    }
+
+    private boolean deleteObjectVersion(String objectName, String versionId) {
         try {
             baseOssService.printOperation(getPlatform().getKey(), "deleteObject", objectName);
-            cosClient.deleteObject(bucketName, objectName);
+            if (CharSequenceUtil.isNotBlank(versionId)) {
+                cosClient.deleteVersion(bucketName, objectName, versionId);
+            } else {
+                deletePermanent(objectName);
+            }
         } catch (Exception e) {
             log.error(e.getMessage(), e);
             return false;
         }
         return true;
     }
+
+    /**
+     * 永久删除对象, 删除对象的所有版本（包括删除标记）
+     * @param objectName 对象名称
+     */
+    private void deletePermanent(String objectName) {
+        ArrayList<DeleteObjectsRequest.KeyVersion> delObjects = new ArrayList<>();
+        String nextKeyMarker = null;
+        String nextVersionIdMarker = null;
+        VersionListing versionListing;
+        do {
+            ListVersionsRequest listVersionsRequest = new ListVersionsRequest();
+            listVersionsRequest.setBucketName(bucketName);
+            listVersionsRequest.setPrefix(objectName);
+            listVersionsRequest.setKeyMarker(nextKeyMarker);
+            listVersionsRequest.setVersionIdMarker(nextVersionIdMarker);
+
+            versionListing = cosClient.listVersions(listVersionsRequest);
+            if (!versionListing.getVersionSummaries().isEmpty()) {
+                for (COSVersionSummary vs : versionListing.getVersionSummaries()) {
+                    if (vs.getKey().equals(objectName)) {
+                        delObjects.add(new DeleteObjectsRequest.KeyVersion(vs.getKey(), vs.getVersionId()));
+                    }
+                }
+            }
+            nextKeyMarker = versionListing.getNextKeyMarker();
+            nextVersionIdMarker = versionListing.getNextVersionIdMarker();
+        } while (versionListing.isTruncated());
+
+        if (!delObjects.isEmpty()) {
+            DeleteObjectsRequest deleteObjectsRequest = new DeleteObjectsRequest(bucketName);
+            deleteObjectsRequest.setKeys(delObjects);
+            cosClient.deleteObjects(deleteObjectsRequest);
+        }
+    }
+
 
     @Override
     public boolean deleteDir(String objectName) {
@@ -377,14 +566,26 @@ public class TencentOssService implements IOssService {
     }
 
     @Override
-    public FileInfo getThumbnail(String objectName, File file, int width) {
+    public void completeMultipartUploadWithParts(String objectName, String uploadId, List<PartInfo> partInfoList, Long fileTotalSize) {
+        baseOssService.printOperation(getPlatform().getKey(), "completeMultipartUploadWithParts", objectName);
+        List<PartETag> partETags = new ArrayList<>();
+        for (PartInfo partInfo : partInfoList) {
+            partETags.add(new PartETag(partInfo.getPartNumber(), partInfo.getEtag()));
+        }
+        // 完成分片上传
+        CompleteMultipartUploadRequest completeMultipartUploadRequest = new CompleteMultipartUploadRequest(bucketName, objectName, uploadId, partETags);
+        cosClient.completeMultipartUpload(completeMultipartUploadRequest);
+        baseOssService.onUploadSuccess(objectName, fileTotalSize);
+    }
+
+    @Override
+    public InputStream getThumbnail(String objectName, int width) {
         try {
             GetObjectRequest request = new GetObjectRequest(bucketName, objectName);
             // 指定目标图片宽度为 Width，高度等比缩放
             String rule = "imageMogr2/thumbnail/" + width + "x";
             request.putCustomQueryParameter(rule, null);
-            cosClient.getObject(request, file);
-            return baseOssService.getFileInfo(objectName);
+            return cosClient.getObject(request).getObjectContent();
         } catch (Exception e) {
             log.error(e.getMessage(), e);
         }
@@ -504,7 +705,7 @@ public class TencentOssService implements IOssService {
     }
 
     @Override
-    public void uploadFile(InputStream inputStream, String objectName, long inputStreamLength) {
+    public boolean uploadFile(InputStream inputStream, String objectName, long inputStreamLength) {
         baseOssService.printOperation(getPlatform().getKey(), "uploadFile inputStream", objectName);
         ObjectMetadata objectMetadata = new ObjectMetadata();
         // 上传的流如果能够获取准确的流长度，则推荐一定填写 content-length
@@ -515,24 +716,79 @@ public class TencentOssService implements IOssService {
         try {
             cosClient.putObject(putObjectRequest);
             baseOssService.onUploadSuccess(objectName, inputStreamLength);
+            return true;
         } catch (CosClientException e) {
             log.error(e.getMessage(), e);
         }
+        return false;
     }
 
     @Override
-    public URL getPresignedObjectUrl(String objectName, int expiryTime) {
+    public String getPresignedObjectUrl(String objectName, int expiryTime, boolean isDownload) {
         try {
             // 设置签名过期时间(可选), 若未进行设置则默认使用 ClientConfig 中的签名过期时间(1小时)
             // 这里设置签名在半个小时后过期
             Date expirationDate = new Date(System.currentTimeMillis() + expiryTime * 1000L);
             // 请求的 HTTP 方法，上传请求用 PUT，下载请求用 GET，删除请求用 DELETE
-            HttpMethodName method = HttpMethodName.GET;
-            return cosClient.generatePresignedUrl(bucketName, objectName, expirationDate, method);
+            GeneratePresignedUrlRequest generatePresignedUrlRequest = new GeneratePresignedUrlRequest(bucketName, objectName, HttpMethodName.GET);
+
+            if (isDownload) {
+                String downloadFileName = Path.of(objectName).getFileName().toString();
+                String contentDisposition = "attachment; filename=\"" + downloadFileName + "\"";
+                String contentType = baseOssService.getContentType(objectName);
+                com.qcloud.cos.model.ResponseHeaderOverrides responseHeaderOverrides = new com.qcloud.cos.model.ResponseHeaderOverrides();
+                responseHeaderOverrides.setContentDisposition(contentDisposition);
+                responseHeaderOverrides.setContentType(contentType);
+                generatePresignedUrlRequest.setResponseHeaders(responseHeaderOverrides);
+            }
+
+            generatePresignedUrlRequest.setExpiration(expirationDate);
+            return cosClient.generatePresignedUrl(generatePresignedUrlRequest).toString();
         } catch (CosClientException e) {
             log.error(e.getMessage(), e);
         }
         return null;
+    }
+
+    @Override
+    public String getPresignedPutUrl(String objectName, String contentType, int expiryTime) {
+        try {
+            // 设置签名过期时间(可选), 若未进行设置则默认使用 ClientConfig 中的签名过期时间(1小时)
+            // 这里设置签名在半个小时后过期
+            Date expirationDate = new Date(System.currentTimeMillis() + expiryTime * 1000L);
+            GeneratePresignedUrlRequest generatePresignedUrlRequest = new GeneratePresignedUrlRequest(bucketName, objectName, HttpMethodName.PUT);
+            generatePresignedUrlRequest.setExpiration(expirationDate);
+            if (contentType != null) {
+                generatePresignedUrlRequest.setContentType(contentType);
+            }
+            // 请求的 HTTP 方法，上传请求用 PUT，下载请求用 GET，删除请求用 DELETE
+            return cosClient.generatePresignedUrl(generatePresignedUrlRequest).toString();
+        } catch (CosClientException e) {
+            log.error(e.getMessage(), e);
+        }
+        return null;
+    }
+
+    @Override
+    public Map<Integer, String> getPresignedUploadPartUrls(String objectName, String uploadId, int totalParts, int expiryTime) {
+        Map<Integer, String> urlMap = new HashMap<>(totalParts);
+        for (int partNumber = 1; partNumber <= totalParts; partNumber++) {
+            try {
+                Date expirationDate = new Date(System.currentTimeMillis() + expiryTime * 1000L);
+                GeneratePresignedUrlRequest request = new GeneratePresignedUrlRequest(bucketName, objectName, HttpMethodName.PUT);
+                request.setExpiration(expirationDate);
+                request.addRequestParameter("partNumber", String.valueOf(partNumber));
+                request.addRequestParameter("uploadId", uploadId);
+                String url = cosClient.generatePresignedUrl(request).toString();
+                if (url != null) {
+                    urlMap.put(partNumber, url);
+                }
+            } catch (Exception e) {
+                log.error("Error generating presigned upload part URL for: {}", objectName, e);
+                return null;
+            }
+        }
+        return urlMap;
     }
 
     @Override

@@ -3,6 +3,7 @@ package com.jmal.clouddisk.config;
 import cn.hutool.core.io.file.PathUtil;
 import cn.hutool.core.util.StrUtil;
 import com.jmal.clouddisk.lucene.LuceneService;
+import com.jmal.clouddisk.service.Constants;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.context.properties.ConfigurationProperties;
@@ -26,10 +27,16 @@ import java.util.List;
 @ConfigurationProperties(prefix = "file")
 @Slf4j
 public class FileProperties {
+
+    private String testTempDir = System.getProperty("user.dir") + "/testTempDir";
     /***
      * 文件存储根目录 文件监控目录
      */
     private String rootDir = System.getProperty("user.dir");
+    /**
+     * 数据库文件和相关文件存储目录, 位于rootDir下
+     */
+    private String dbDir = "jmalcloud_db";
     /***
      * 断点续传的临时文件目录名称 位于rootDir下,文件监控扫描忽略的目录
      */
@@ -119,6 +126,19 @@ public class FileProperties {
      */
     private Integer ngramMaxSize = 6;
 
+    /**
+     * 是否重置管理员密码
+     */
+    private Boolean resetAdminPassword = false;
+
+    private String frontendResourcePath = "/app/frontend/dist/";
+
+    private String pdfjsResourcePath = "/app/preview/pdfjs/";
+
+    private String drawioResourcePath = "/app/preview/draw/";
+
+    private String excalidrawResourcePath = "/app/preview/excalidraw/";
+
     public void setIp2regionDbPath(String path) {
         Path dbPath = Paths.get(path);
         if (!PathUtil.exists(dbPath, true)) {
@@ -173,6 +193,14 @@ public class FileProperties {
         return Paths.get(rootDir).toString();
     }
 
+    public String getJmalcloudDBDir() {
+        return Paths.get(dbDir).toString();
+    }
+
+    public Path getTestTempDirPath() {
+        return Paths.get(testTempDir);
+    }
+
     public String getUserImgDir() {
         return Paths.get(userImgDir).toString();
     }
@@ -201,7 +229,10 @@ public class FileProperties {
         if (getLuceneIndexDir().equals(username)) {
             return true;
         }
-        return username.startsWith("log-");
+        if (getJmalcloudDBDir().equals(username)) {
+            return true;
+        }
+        return username.startsWith(Constants.LOGO_NAME_PREFIX);
     }
 
 

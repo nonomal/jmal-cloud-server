@@ -3,15 +3,18 @@ package com.jmal.clouddisk.webdav;
 import cn.hutool.core.util.StrUtil;
 import com.jmal.clouddisk.config.FileProperties;
 import com.jmal.clouddisk.config.WebFilter;
+import com.jmal.clouddisk.service.impl.RoleService;
 import com.jmal.clouddisk.service.impl.UserServiceImpl;
 import com.jmal.clouddisk.util.CaffeineUtil;
 import com.jmal.clouddisk.util.PasswordHash;
+import lombok.RequiredArgsConstructor;
 import org.apache.catalina.Context;
 import org.apache.catalina.connector.Request;
 import org.apache.catalina.connector.Response;
 import org.apache.catalina.realm.GenericPrincipal;
 import org.apache.catalina.realm.RealmBase;
 import org.apache.tomcat.util.descriptor.web.SecurityConstraint;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
 import java.nio.file.Path;
@@ -20,9 +23,12 @@ import java.security.Principal;
 import java.util.*;
 
 @Component
+@RequiredArgsConstructor
 public class MyRealm extends RealmBase {
 
-    private final UserServiceImpl userService;
+    private final ObjectProvider<UserServiceImpl> userServiceObjectProvider;
+
+    private final ObjectProvider<RoleService> roleServiceObjectProvider;
 
     private final FileProperties fileProperties;
 
@@ -45,11 +51,6 @@ public class MyRealm extends RealmBase {
 
     private static final List<String> DEFAULT_ROLES = List.of("webdav");
 
-    public MyRealm(UserServiceImpl userService, FileProperties fileProperties) {
-        this.userService = userService;
-        this.fileProperties = fileProperties;
-    }
-
     @Override
     protected String getPassword(String username) {
         return null;
@@ -62,7 +63,7 @@ public class MyRealm extends RealmBase {
 
     @Override
     public Principal authenticate(String username, String password) {
-        String hashPassword = userService.getHashPasswordUserName(username);
+        String hashPassword = userServiceObjectProvider.getObject().getHashPasswordUserName(username);
         if (StrUtil.isBlank(hashPassword)) {
             return null;
         }
@@ -119,7 +120,7 @@ public class MyRealm extends RealmBase {
     public int maxAuthority(String username) {
         List<String> authorities = CaffeineUtil.getAuthoritiesCache(username);
         if (authorities == null) {
-            authorities = userService.getAuthorities(username);
+            authorities = roleServiceObjectProvider.getObject().getAuthorities(username);
         }
 
         Map<String, Integer> authorityMap = Map.of(

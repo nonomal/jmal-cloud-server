@@ -208,7 +208,7 @@ public class FileContentTypeUtils {
         CONTENT_TYPE_MAP.put("iges", "application/acad");
         CONTENT_TYPE_MAP.put("igs", "application/acad");
         CONTENT_TYPE_MAP.put("dwt", "application/acad");
-        CONTENT_TYPE_MAP.put("dng", "application/acad");
+        CONTENT_TYPE_MAP.put("dng", "image/x-adobe-dng");
         CONTENT_TYPE_MAP.put("e", "text/x-eiffel");
         CONTENT_TYPE_MAP.put("egon", "application/x-egon");
         CONTENT_TYPE_MAP.put("eif", "text/x-eiffel");
@@ -778,5 +778,8 @@ public class FileContentTypeUtils {
         CONTENT_TYPE_MAP.put("z", "application/x-compress");
         CONTENT_TYPE_MAP.put("zabw", "application/x-abiword");
         CONTENT_TYPE_MAP.put("zip", "application/zip");
+        CONTENT_TYPE_MAP.put("glb", "model/gltf-binary");
+        CONTENT_TYPE_MAP.put("gltf", "model/gltf+json");
+        CONTENT_TYPE_MAP.put("fbx", "application/octet-stream");
     }
 }

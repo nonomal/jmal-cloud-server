@@ -1,6 +1,5 @@
 package com.jmal.clouddisk.util;
 
-import cn.hutool.core.util.URLUtil;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.jmal.clouddisk.model.rbac.ConsumerDO;
@@ -35,11 +34,6 @@ public class CaffeineUtil {
      * 文件历史记录缓存, 避免过于频繁的记录文件历史，3分钟内只记录一次
      */
     public static final Cache<String, Long> FILE_HISTORY_CACHE = Caffeine.newBuilder().expireAfterWrite(3, TimeUnit.MINUTES).build();
-
-    /**
-     * 缩略图请求缓存
-     */
-    private static final Cache<String, Boolean> THUMBNAIL_REQUEST_CACHE = Caffeine.newBuilder().expireAfterWrite(60, TimeUnit.SECONDS).build();
 
     /**
      * 用户oss存储路径前缀缓存
@@ -110,15 +104,6 @@ public class CaffeineUtil {
         return AUTHORITIES_CACHE.getIfPresent(username);
     }
 
-    /***
-     * 缓存中是否存在该username的权限
-     * @param username username
-     * @return bool
-     */
-    public static boolean existsAuthoritiesCache(String username) {
-        return AUTHORITIES_CACHE.getIfPresent(username) != null;
-    }
-
     public static void setAuthoritiesCache(String username, List<String> authorities) {
         AUTHORITIES_CACHE.put(username, authorities);
     }
@@ -137,6 +122,10 @@ public class CaffeineUtil {
 
     public static void removeUserIdCache(String username) {
         USER_ID_CACHE.invalidate(username);
+    }
+
+    public static void invalidateAllConsumerCache() {
+        CONSUMER_USERNAME.invalidateAll();
     }
 
     @PostConstruct
@@ -256,7 +245,7 @@ public class CaffeineUtil {
      * @return oss path
      */
     public static String getOssPath(Path path) {
-        path = Paths.get(URLUtil.decode(path.toString()));
+        path = Paths.get(FileNameUtils.decodeAndCheckPath(path.toString()));
         String prePath;
         if (path.getNameCount() >= 2) {
             prePath = MyWebdavServlet.PATH_DELIMITER + path.subpath(0, 2);
@@ -281,14 +270,6 @@ public class CaffeineUtil {
 
     public static void setUploadFileCache(String key) {
         UPLOAD_FILE_CACHE.put(key, System.currentTimeMillis());
-    }
-
-    public static Boolean hasThumbnailRequestCache(String id) {
-        return THUMBNAIL_REQUEST_CACHE.get(id, key -> false);
-    }
-
-    public static void setThumbnailRequestCache(String id) {
-        THUMBNAIL_REQUEST_CACHE.put(id, true);
     }
 
     public static String getUsernameCache(String userId) {

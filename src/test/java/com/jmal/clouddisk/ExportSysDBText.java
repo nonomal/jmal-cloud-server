@@ -2,12 +2,12 @@ package com.jmal.clouddisk;
 
 import cn.hutool.core.date.LocalDateTimeUtil;
 import cn.hutool.core.io.FileUtil;
-import com.alibaba.fastjson.JSONArray;
 import com.jmal.clouddisk.model.rbac.MenuDO;
 import com.jmal.clouddisk.model.rbac.RoleDO;
 import com.jmal.clouddisk.service.impl.MenuService;
 import com.jmal.clouddisk.service.impl.RoleService;
 import com.jmal.clouddisk.util.TimeUntils;
+import net.minidev.json.JSONArray;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;

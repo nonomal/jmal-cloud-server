@@ -1,12 +1,13 @@
 package com.jmal.clouddisk.model;
 
+import com.jmal.clouddisk.config.Reflective;
 import io.swagger.v3.oas.annotations.media.Schema;
-
+import jakarta.persistence.Column;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
 import lombok.Data;
 import org.springframework.data.annotation.Id;
 
-import jakarta.validation.Valid;
-import jakarta.validation.constraints.NotNull;
 import java.text.Collator;
 import java.util.Comparator;
 import java.util.List;
@@ -19,7 +20,7 @@ import java.util.List;
 @Data
 @Schema
 @Valid
-public class CategoryDTO implements Comparable<CategoryDTO> {
+public class CategoryDTO implements Comparable<CategoryDTO>, Reflective {
 
     @Id
     @Schema(hidden = true)
@@ -30,12 +31,14 @@ public class CategoryDTO implements Comparable<CategoryDTO> {
 
     @NotNull(message = "分类名称不能为空")
     @Schema(name = "name", title = "分类名称", example = "新建分类", requiredMode = Schema.RequiredMode.REQUIRED)
+    @Column(unique = true, nullable = false)
     private String name;
 
     /***
      * 缩略名，默认为name
      */
     @Schema(name = "slug", title = "分类缩略名")
+    @Column(unique = true, nullable = false)
     private String slug;
     /***
      * 父级分类Id

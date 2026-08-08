@@ -1,9 +1,14 @@
 package com.jmal.clouddisk.model;
 
-import com.jmal.clouddisk.model.rbac.ConsumerDO;
-import com.jmal.clouddisk.service.impl.UserServiceImpl;
-import lombok.Data;
+import com.jmal.clouddisk.config.Reflective;
+import com.jmal.clouddisk.config.jpa.AuditableEntity;
+import jakarta.persistence.*;
+import lombok.Getter;
+import lombok.Setter;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
 import org.springframework.data.mongodb.core.mapping.Document;
+import org.springframework.security.crypto.encrypt.TextEncryptor;
 
 import java.util.List;
 
@@ -12,10 +17,12 @@ import java.util.List;
  * @Description LdapDO
  * @date 2023/5/8 18:00
  */
-@Data
+@Getter
+@Setter
 @Document(collection = "ldapConfig")
-public class LdapConfigDO {
-    String id;
+@Entity
+@Table(name = "ldap_config")
+public class LdapConfigDO extends AuditableEntity implements Reflective {
     /**
      * 是否启用
      */
@@ -27,6 +34,8 @@ public class LdapConfigDO {
     /**
      * 默认角色
      */
+    @Column(name = "roles")
+    @JdbcTypeCode(SqlTypes.JSON)
     List<String> defaultRoleList;
     /**
      * 管理账号密码
@@ -47,12 +56,12 @@ public class LdapConfigDO {
 
     String userId;
 
-    public LdapConfigDTO toLdapConfigDTO(ConsumerDO consumerDO) {
+    public LdapConfigDTO toLdapConfigDTO(TextEncryptor textEncryptor) {
         LdapConfigDTO ldapConfigDTO = new LdapConfigDTO();
         ldapConfigDTO.setEnable(this.enable);
         ldapConfigDTO.setLdapServer(this.ldapServer);
         ldapConfigDTO.setDefaultRoleList(this.defaultRoleList);
-        ldapConfigDTO.setPassword(UserServiceImpl.getDecryptStrByUser(this.password, consumerDO));
+        ldapConfigDTO.setPassword(textEncryptor.decrypt(this.password));
         ldapConfigDTO.setBaseDN(this.baseDN);
         ldapConfigDTO.setUserDN(this.userDN);
         ldapConfigDTO.setLoginName(this.loginName);

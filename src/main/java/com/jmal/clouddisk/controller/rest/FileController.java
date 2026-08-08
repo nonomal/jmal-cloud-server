@@ -2,19 +2,26 @@ package com.jmal.clouddisk.controller.rest;
 
 import cn.hutool.core.text.CharSequenceUtil;
 import cn.hutool.core.util.BooleanUtil;
-import cn.hutool.core.util.URLUtil;
 import com.jmal.clouddisk.annotation.LogOperatingFun;
 import com.jmal.clouddisk.annotation.Permission;
+import com.jmal.clouddisk.config.Reflective;
 import com.jmal.clouddisk.exception.CommonException;
 import com.jmal.clouddisk.exception.ExceptionType;
-import com.jmal.clouddisk.model.*;
+import com.jmal.clouddisk.model.EditTagDTO;
+import com.jmal.clouddisk.model.LogOperation;
+import com.jmal.clouddisk.model.UploadApiParamDTO;
+import com.jmal.clouddisk.model.file.FileDocument;
+import com.jmal.clouddisk.model.file.FileIntroVO;
 import com.jmal.clouddisk.oss.web.WebOssCommonService;
 import com.jmal.clouddisk.oss.web.WebOssService;
 import com.jmal.clouddisk.service.Constants;
 import com.jmal.clouddisk.service.IFileService;
 import com.jmal.clouddisk.service.IUserService;
+import com.jmal.clouddisk.service.impl.CommonFileService;
+import com.jmal.clouddisk.service.impl.UserFileService;
 import com.jmal.clouddisk.service.impl.UserLoginHolder;
 import com.jmal.clouddisk.util.CaffeineUtil;
+import com.jmal.clouddisk.util.FileNameUtils;
 import com.jmal.clouddisk.util.ResponseResult;
 import com.jmal.clouddisk.util.ResultUtil;
 import io.swagger.v3.oas.annotations.Operation;
@@ -22,10 +29,18 @@ import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
+import org.springframework.core.io.InputStreamResource;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
@@ -35,7 +50,6 @@ import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
-
 
 /**
  * @author jmal
@@ -50,18 +64,26 @@ public class FileController {
 
     private final IFileService fileService;
 
+    private final CommonFileService commonFileService;
+
+    private final UserFileService userFileService;
+
     private final WebOssService webOssService;
 
     private final UserLoginHolder userLoginHolder;
 
     private final IUserService userService;
 
+    public record DownloadBeforeResult(boolean allowDownload, boolean isRedirect, String redirectUrl)
+            implements Reflective {
+    }
+
     @Operation(summary = "根据id获取文件信息")
     @GetMapping("/file_info")
     @Permission("cloud:file:list")
     @LogOperatingFun(logType = LogOperation.Type.BROWSE)
     public ResponseResult<FileDocument> getFileById(@RequestParam String id) {
-        return ResultUtil.success(fileService.getById(id));
+        return ResultUtil.success(commonFileService.getById(id));
     }
 
     @Operation(summary = "文件列表")
@@ -102,11 +124,13 @@ public class FileController {
         }
         String filepath = request.getHeader(Constants.FILE_PATH);
         if (CharSequenceUtil.isBlank(filepath)) {
-            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(), "headers里缺少参数, filepath: 远程目标文件夹, 例如: '/Image/Typora/Public/Images'");
+            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(),
+                    "headers里缺少参数, filepath: 远程目标文件夹, 例如: '/Image/Typora/Public/Images'");
         }
         String baseUrl = request.getHeader("baseurl");
         if (CharSequenceUtil.isBlank(baseUrl)) {
-            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(), "headers里缺少参数, baseUrl: 远程服务器地址, 例如: 'https://www.jmal.top/api'");
+            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(),
+                    "headers里缺少参数, baseUrl: 远程服务器地址, 例如: 'https://www.jmal.top/api'");
         }
         return fileService.imgUpload(baseUrl, filepath, file);
     }
@@ -158,7 +182,8 @@ public class FileController {
     @GetMapping("/preview/text")
     @Permission("cloud:file:list")
     @LogOperatingFun(logType = LogOperation.Type.BROWSE)
-    public ResponseResult<Object> previewText(@RequestParam String id, @RequestParam String path, @RequestParam String fileName, Boolean content) {
+    public ResponseResult<Object> previewText(@RequestParam String id, @RequestParam String path,
+            @RequestParam String fileName, Boolean content) {
         String ossPath = CaffeineUtil.getOssPath(Paths.get(id));
         if (ossPath != null) {
             Path prePth = Paths.get(WebOssCommonService.getUsernameByOssPath(ossPath), path, fileName);
@@ -171,7 +196,8 @@ public class FileController {
     @GetMapping("/preview/text/stream")
     @Permission("cloud:file:list")
     @LogOperatingFun(logType = LogOperation.Type.BROWSE)
-    public ResponseEntity<StreamingResponseBody> previewTextStream(@RequestParam String id, @RequestParam String path, @RequestParam String fileName) {
+    public ResponseEntity<StreamingResponseBody> previewTextStream(@RequestParam String id, @RequestParam String path,
+            @RequestParam String fileName) {
         String ossPath = CaffeineUtil.getOssPath(Paths.get(id));
         StreamingResponseBody responseBody;
         if (ossPath != null) {
@@ -193,21 +219,22 @@ public class FileController {
         if (ossPath != null) {
             return ResultUtil.success(webOssService.readToText(ossPath, prePth, false));
         }
-        return ResultUtil.success(fileService.previewTextByPath(URLUtil.decode(path), username));
+        return ResultUtil.success(fileService.previewTextByPath(FileNameUtils.decodeAndCheckPath(path), username));
     }
 
     @Operation(summary = "根据path流式读取simText文件")
     @GetMapping("/preview/path/text/stream")
     @Permission("cloud:file:list")
     @LogOperatingFun(logType = LogOperation.Type.BROWSE)
-    public ResponseEntity<StreamingResponseBody> previewTextByPathStream(@RequestParam String path, @RequestParam String username) {
+    public ResponseEntity<StreamingResponseBody> previewTextByPathStream(@RequestParam String path,
+            @RequestParam String username) {
         Path prePth = Paths.get(username, path);
         String ossPath = CaffeineUtil.getOssPath(prePth);
         StreamingResponseBody responseBody;
         if (ossPath != null) {
             responseBody = webOssService.readToTextStream(ossPath, prePth);
         } else {
-            responseBody = fileService.previewTextByPathStream(URLUtil.decode(path), username);
+            responseBody = fileService.previewTextByPathStream(FileNameUtils.decodeAndCheckPath(path), username);
         }
         return new ResponseEntity<>(responseBody, HttpStatus.OK);
     }
@@ -215,57 +242,55 @@ public class FileController {
     @Operation(summary = "是否允许下载")
     @GetMapping("/isAllowDownload")
     @Permission("cloud:file:download")
-    public ResponseResult<Object> isAllowDownload(@RequestParam List<String> fileIds) {
+    public ResponseResult<DownloadBeforeResult> isAllowDownload(@RequestParam List<String> fileIds) {
         return fileService.isAllowDownload(fileIds);
     }
 
     @Operation(summary = "是否允许批量下载")
     @GetMapping("/isAllowPackageDownload")
     @Permission("cloud:file:packageDownload")
-    public ResponseResult<Object> isAllowPackageDownload(@RequestParam List<String> fileIds) {
-        return fileService.isAllowDownload(fileIds);
+    public ResponseResult<FileController.DownloadBeforeResult> isAllowPackageDownload(
+            @RequestParam List<String> fileIds) {
+        return fileService.isAllowPackageDownload(fileIds);
     }
 
     @Operation(summary = "打包下载")
     @GetMapping("/packageDownload")
     @Permission("cloud:file:packageDownload")
     @LogOperatingFun
-    public void packageDownload(HttpServletRequest request, HttpServletResponse response, @RequestParam String[] fileIds) {
+    public void packageDownload(HttpServletRequest request, HttpServletResponse response,
+            @RequestParam String[] fileIds) {
         if (fileIds != null && fileIds.length > 0) {
             List<String> fileIdList = Arrays.asList(fileIds);
             fileService.packageDownload(request, response, fileIdList);
         } else {
-            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(), ExceptionType.MISSING_PARAMETERS.getMsg());
+            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(),
+                    ExceptionType.MISSING_PARAMETERS.getMsg());
         }
-    }
-
-    @Operation(summary = "获取dwg文件对应的mxweb文件")
-    @GetMapping("/view/mxweb/{fileId}")
-    @Permission("cloud:file:list")
-    @LogOperatingFun(logType = LogOperation.Type.BROWSE)
-    public ResponseEntity<Object> getMxweb(@PathVariable String fileId) {
-        Optional<FileDocument> file = fileService.getMxweb(fileId);
-        return file.map(fileService::getObjectResponseEntity).orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND).body("找不到该文件"));
     }
 
     @Operation(summary = "显示缩略图")
     @GetMapping("/view/thumbnail")
     @Permission("cloud:file:list")
     @LogOperatingFun(logType = LogOperation.Type.BROWSE)
-    public ResponseEntity<Object> thumbnail(@RequestParam String id, Boolean showCover) {
+    public ResponseEntity<InputStreamResource> thumbnail(@RequestParam String id, Boolean showCover) {
+        if (CharSequenceUtil.isBlank(id)) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+        }
         String ossPath = CaffeineUtil.getOssPath(Paths.get(id));
         if (ossPath != null) {
             return webOssService.thumbnail(ossPath, id);
         }
         Optional<FileDocument> file = fileService.thumbnail(id, showCover);
-        return file.map(fileService::getObjectResponseEntity).orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND).body("找不到该文件"));
+        return file.map(fileService::getImageInputStreamResourceEntity)
+                .orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND).build());
     }
 
     @Operation(summary = "显示缩略图")
     @GetMapping("/view/thumbnail/user/{username}")
     @Permission("cloud:file:list")
     @LogOperatingFun(logType = LogOperation.Type.BROWSE)
-    public ResponseEntity<Object> thumbnailByUsername(@PathVariable String username, Boolean showCover) {
+    public ResponseEntity<InputStreamResource> thumbnailByUsername(@PathVariable String username, Boolean showCover) {
         String avatar = userService.getAvatarByUsername(username);
         return thumbnail(avatar, showCover);
     }
@@ -274,7 +299,7 @@ public class FileController {
     @GetMapping("/view/thumbnail/{filename}")
     @Permission("cloud:file:list")
     @LogOperatingFun(logType = LogOperation.Type.BROWSE)
-    public ResponseEntity<Object> thumbnailName(@RequestParam String id, Boolean showCover) {
+    public ResponseEntity<InputStreamResource> thumbnailName(@RequestParam String id, Boolean showCover) {
         return thumbnail(id, showCover);
     }
 
@@ -282,10 +307,11 @@ public class FileController {
     @GetMapping("/view/cover")
     @Permission("cloud:file:list")
     @LogOperatingFun(logType = LogOperation.Type.BROWSE)
-    public ResponseEntity<Object> coverOfMedia(String id, String name) {
-        ResultUtil.checkParamIsNull(id, name);
-        Optional<FileDocument> file = fileService.coverOfMedia(id, name);
-        return file.map(fileService::getObjectResponseEntity).orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND).body("找不到该文件"));
+    public ResponseEntity<InputStreamResource> coverOfMedia(String id) {
+        ResultUtil.checkParamIsNull(id);
+        Optional<FileDocument> file = fileService.coverOfMedia(id, null);
+        return file.map(fileService::getImageInputStreamResourceEntity)
+                .orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND).build());
     }
 
     @Operation(summary = "收藏文件或文件夹")
@@ -297,7 +323,8 @@ public class FileController {
             List<String> list = Arrays.asList(fileIds);
             return fileService.favorite(list);
         } else {
-            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(), ExceptionType.MISSING_PARAMETERS.getMsg());
+            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(),
+                    ExceptionType.MISSING_PARAMETERS.getMsg());
         }
     }
 
@@ -313,7 +340,8 @@ public class FileController {
     @PutMapping("/updateTag")
     @LogOperatingFun
     @Permission("cloud:file:update")
-    public ResponseResult<Object> updateTag(@RequestParam String tagId, @RequestParam String name, @RequestParam String color) {
+    public ResponseResult<Object> updateTag(@RequestParam String tagId, @RequestParam String name,
+            @RequestParam String color) {
         return fileService.setTag(tagId, name, color);
     }
 
@@ -330,7 +358,7 @@ public class FileController {
     @LogOperatingFun
     @Permission("cloud:file:update")
     public ResponseResult<Object> setPublic(@RequestParam String fileId) {
-        fileService.setPublic(fileId);
+        userFileService.setPublic(fileId);
         return ResultUtil.success();
     }
 
@@ -343,19 +371,23 @@ public class FileController {
             List<String> list = Arrays.asList(fileIds);
             return fileService.unFavorite(list);
         } else {
-            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(), ExceptionType.MISSING_PARAMETERS.getMsg());
+            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(),
+                    ExceptionType.MISSING_PARAMETERS.getMsg());
         }
     }
 
     @Operation(summary = "删除文件")
     @DeleteMapping("/delete")
     @Permission("cloud:file:delete")
-    public ResponseResult<Object> delete(@RequestParam String username, @RequestParam String[] fileIds, @RequestParam String currentDirectory, Boolean sweep) {
+    public ResponseResult<Object> delete(@RequestParam String username, @RequestParam String[] fileIds,
+            @RequestParam String currentDirectory, Boolean sweep) {
         if (fileIds != null && fileIds.length > 0) {
             List<String> list = Arrays.asList(fileIds);
-            return fileService.delete(username, currentDirectory, list, userLoginHolder.getUsername(), BooleanUtil.isTrue(sweep));
+            return fileService.delete(username, currentDirectory, list, userLoginHolder.getUsername(),
+                    BooleanUtil.isTrue(sweep));
         } else {
-            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(), ExceptionType.MISSING_PARAMETERS.getMsg());
+            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(),
+                    ExceptionType.MISSING_PARAMETERS.getMsg());
         }
     }
 
@@ -367,7 +399,8 @@ public class FileController {
             List<String> list = Arrays.asList(fileIds);
             return fileService.restore(list, userLoginHolder.getUsername());
         } else {
-            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(), ExceptionType.MISSING_PARAMETERS.getMsg());
+            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(),
+                    ExceptionType.MISSING_PARAMETERS.getMsg());
         }
     }
 
@@ -379,7 +412,8 @@ public class FileController {
             List<String> list = Arrays.asList(fileIds);
             return fileService.sweep(list, userLoginHolder.getUsername());
         } else {
-            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(), ExceptionType.MISSING_PARAMETERS.getMsg());
+            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(),
+                    ExceptionType.MISSING_PARAMETERS.getMsg());
         }
     }
 
@@ -395,43 +429,50 @@ public class FileController {
     @GetMapping("/rename")
     @LogOperatingFun
     @Permission("cloud:file:update")
-    public ResponseResult<Object> rename(@RequestParam String newFileName, @RequestParam String username, @RequestParam String id, String folder) {
-        return fileService.rename(URLUtil.decode(newFileName), username, id, folder);
+    public ResponseResult<Object> rename(@RequestParam String newFileName, @RequestParam String username,
+            @RequestParam String id, String folder) {
+        return fileService.rename(FileNameUtils.decodeAndCheckPath(newFileName), username, id, folder);
     }
 
     @Operation(summary = "移动或复制前检查目标目录是否存在要移动或复制的文件")
     @GetMapping("/check-move-copy")
     @Permission("cloud:file:update")
-    public ResponseResult<List<FileDocument>> checkMoveOrCopy(UploadApiParamDTO upload, @RequestParam String[] froms, String to) throws IOException {
+    public ResponseResult<List<FileDocument>> checkMoveOrCopy(UploadApiParamDTO upload, @RequestParam String[] froms,
+            String to) throws IOException {
         if (froms != null && froms.length > 0) {
             List<String> list = Arrays.asList(froms);
             return fileService.checkMoveOrCopy(upload, list, to);
         } else {
-            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(), ExceptionType.MISSING_PARAMETERS.getMsg());
+            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(),
+                    ExceptionType.MISSING_PARAMETERS.getMsg());
         }
     }
 
     @Operation(summary = "移动文件/文件夹")
     @GetMapping("/move")
     @Permission("cloud:file:update")
-    public ResponseResult<Object> move(UploadApiParamDTO upload, @RequestParam String[] froms, String to) throws IOException {
+    public ResponseResult<Object> move(UploadApiParamDTO upload, @RequestParam String[] froms, String to)
+            throws IOException {
         if (froms != null && froms.length > 0) {
             List<String> list = Arrays.asList(froms);
             return fileService.move(upload, list, to);
         } else {
-            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(), ExceptionType.MISSING_PARAMETERS.getMsg());
+            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(),
+                    ExceptionType.MISSING_PARAMETERS.getMsg());
         }
     }
 
     @Operation(summary = "复制文件/文件夹")
     @GetMapping("/copy")
     @Permission("cloud:file:update")
-    public ResponseResult<Object> copy(UploadApiParamDTO upload, @RequestParam String[] froms, String to) throws IOException {
+    public ResponseResult<Object> copy(UploadApiParamDTO upload, @RequestParam String[] froms, String to)
+            throws IOException {
         if (froms != null && froms.length > 0) {
             List<String> list = Arrays.asList(froms);
             return fileService.copy(upload, list, to);
         } else {
-            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(), ExceptionType.MISSING_PARAMETERS.getMsg());
+            throw new CommonException(ExceptionType.MISSING_PARAMETERS.getCode(),
+                    ExceptionType.MISSING_PARAMETERS.getMsg());
         }
     }
 
@@ -457,34 +498,38 @@ public class FileController {
         if (dir == null) {
             dir = false;
         }
-        return fileService.listFiles(URLUtil.decode(path), username, dir);
+        return fileService.listFiles(FileNameUtils.decodeAndCheckPath(path), username, dir);
     }
 
     @Operation(summary = "获取上级文件列表")
     @GetMapping("/upper-level-list")
     @LogOperatingFun(logType = LogOperation.Type.BROWSE)
     public ResponseResult<Object> upperLevelList(@RequestParam String path, @RequestParam String username) {
-        return fileService.upperLevelList(URLUtil.decode(path), username);
+        return fileService.upperLevelList(FileNameUtils.decodeAndCheckPath(path), username);
     }
 
     @Operation(summary = "根据path删除文件/文件夹")
     @DeleteMapping("/delFile")
     @Permission("cloud:file:delete")
     public ResponseResult<Object> delFile(@RequestParam String path, @RequestParam String username) {
-        return fileService.delFile(URLUtil.decode(path), username);
+        return fileService.delFile(FileNameUtils.decodeAndCheckPath(path), username);
     }
 
     @Operation(summary = "根据path重命名")
     @GetMapping("/rename/path")
     @Permission("cloud:file:update")
-    public ResponseResult<Object> renameByPath(@RequestParam String newFileName, @RequestParam String username, @RequestParam String path) {
-        return fileService.renameByPath(URLUtil.decode(newFileName), username, URLUtil.decode(path));
+    public ResponseResult<Object> renameByPath(@RequestParam String newFileName, @RequestParam String username,
+            @RequestParam String path) {
+        return fileService.renameByPath(FileNameUtils.decodeAndCheckPath(newFileName), username,
+                FileNameUtils.decodeAndCheckPath(path));
     }
 
     @Operation(summary = "根据path添加文件/文件夹")
     @PostMapping("/addfile")
     @Permission("cloud:file:upload")
-    public ResponseResult<FileIntroVO> addFile(@RequestParam String fileName, @RequestParam Boolean isFolder, @RequestParam String username, @RequestParam String parentPath, String folder) {
-        return fileService.addFile(URLUtil.decode(fileName), isFolder, username, URLUtil.decode(parentPath), folder);
+    public ResponseResult<FileIntroVO> addFile(@RequestParam String fileName, @RequestParam Boolean isFolder,
+            @RequestParam String username, @RequestParam String parentPath, String folder) {
+        return fileService.addFile(FileNameUtils.decodeAndCheckPath(fileName), isFolder, username,
+                FileNameUtils.decodeAndCheckPath(parentPath), folder);
     }
 }

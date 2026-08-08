@@ -1,10 +1,12 @@
 package com.jmal.clouddisk.oss;
 
-import java.io.File;
+import com.jmal.clouddisk.model.GridFSBO;
+import org.springframework.data.domain.Page;
+
 import java.io.InputStream;
-import java.net.URL;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
@@ -15,6 +17,11 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public interface IOssService {
 
     PlatformOSS getPlatform();
+
+    /**
+     * 是否启用 S3 代理功能, 启用后上传下载流量会通过jmalcloud服务中转, 默认关闭
+     */
+    Boolean getProxyEnabled();
 
     /**
      * Webdav 获取FileInfo
@@ -39,12 +46,23 @@ public interface IOssService {
 
     /**
      * Webdav 上传文件
-     * @param inputStream 文件输入流
+     * @param inputStream 文件输入流, 使用后需要关闭
      * @param ossPath     ossPath
      * @param objectName  object key
      * @return 是否上传成功
      */
     boolean write(InputStream inputStream, String ossPath, String objectName);
+
+    /**
+     * Webdav 上传文件
+     *
+     * @param inputStream 文件输入流, 使用后需要关闭
+     * @param ossPath     ossPath
+     * @param objectName  object key
+     * @param size       文件大小
+     * @return 是否上传成功
+     */
+    boolean write(InputStream inputStream, String ossPath, String objectName, long size);
 
     /**
      * Webdav 列出当前文件夹下的所有文件和文件夹
@@ -71,6 +89,16 @@ public interface IOssService {
     /**
      * 获取 AbstractOssObject
      * @param objectName object key
+     * @param versionId versionId 版本ID
+     * @return AbstractOssObject
+     */
+    AbstractOssObject getAbstractOssObject(String objectName, String versionId);
+
+    Page<GridFSBO> listObjectVersions(String objectName, Integer pageSize, Integer pageIndex);
+
+    /**
+     * 获取 AbstractOssObject
+     * @param objectName object key
      * @param rangeStart rangeStart 分段
      * @param rangeEnd rangeEnd 分段
      * @return AbstractOssObject
@@ -82,6 +110,15 @@ public interface IOssService {
      * @param objectName object key
      */
     boolean deleteObject(String objectName);
+
+    /**
+     * 删除文件
+     * @param objectName object key
+     * @param versionId versionId 版本ID
+     */
+    boolean deleteObject(String objectName, String versionId);
+
+    void restoreVersion(String objectName, String versionId);
 
     /**
      * 删除文件夹
@@ -128,7 +165,7 @@ public interface IOssService {
      * @param inputStream inputStream
      * @param objectName object key
      */
-    void uploadFile(InputStream inputStream, String objectName, long inputStreamLength);
+    boolean uploadFile(InputStream inputStream, String objectName, long inputStreamLength);
 
     /**
      * 检查Bucket是否存在，并且验证配置是否可用，用于创建OSS配置时使用
@@ -189,22 +226,44 @@ public interface IOssService {
      */
     void completeMultipartUpload(String objectName, String uploadId, Long fileTotalSize);
 
+    void completeMultipartUploadWithParts(String objectName, String uploadId, List<PartInfo> partInfoList, Long fileTotalSize);
+
     /**
      * 获取缩略图, 指定目标图片宽度为 Width，高度等比缩放
      * @param objectName objectName
-     * @param file       临时文件
      * @param width      图片宽度
      */
-    FileInfo getThumbnail(String objectName, File file, int width);
+    InputStream getThumbnail(String objectName, int width);
 
     /**
      * 生成预签名URL
      *
      * @param objectName objectName
      * @param expiryTime 过期时间(秒)
+     * @param isDownload 是否直接下载
      * @return 预签名URL
      */
-    URL getPresignedObjectUrl(String objectName, int expiryTime);
+    String getPresignedObjectUrl(String objectName, int expiryTime, boolean isDownload);
+
+    /**
+     * 生成上传用的预签名URL（PUT）
+     *
+     * @param objectName  文件 key
+     * @param contentType 文件的 Content-Type
+     * @param expiryTime  过期时间(秒)
+     * @return 预签名URL
+     */
+    String getPresignedPutUrl(String objectName, String contentType, int expiryTime);
+
+    /**
+     * 获取分片上传预签名URLs
+     * @param objectName objectName
+     * @param uploadId uploadId
+     * @param totalParts 总分片数
+     * @param expiryTime 过期时间(秒)
+     * @return 分片号和预签名URL的映射表
+     */
+    Map<Integer, String> getPresignedUploadPartUrls(String objectName, String uploadId, int totalParts, int expiryTime);
 
     /**
      * 拷贝对象(相同Bucket之间拷贝)

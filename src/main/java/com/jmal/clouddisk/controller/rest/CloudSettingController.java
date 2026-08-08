@@ -5,18 +5,19 @@ import com.jmal.clouddisk.annotation.Permission;
 import com.jmal.clouddisk.lucene.RebuildIndexTaskService;
 import com.jmal.clouddisk.lucene.TaskProgress;
 import com.jmal.clouddisk.lucene.TaskProgressService;
+import com.jmal.clouddisk.media.TranscodeConfig;
+import com.jmal.clouddisk.media.VideoProcessService;
 import com.jmal.clouddisk.model.LdapConfigDTO;
 import com.jmal.clouddisk.model.LogOperation;
+import com.jmal.clouddisk.model.NetdiskPersonalization;
 import com.jmal.clouddisk.model.WebsiteSettingDTO;
 import com.jmal.clouddisk.ocr.OcrConfig;
 import com.jmal.clouddisk.ocr.OcrService;
 import com.jmal.clouddisk.service.IAuthService;
-import com.jmal.clouddisk.service.IUserService;
+import com.jmal.clouddisk.service.impl.CommonUserFileService;
 import com.jmal.clouddisk.service.impl.SettingService;
 import com.jmal.clouddisk.util.ResponseResult;
 import com.jmal.clouddisk.util.ResultUtil;
-import com.jmal.clouddisk.media.TranscodeConfig;
-import com.jmal.clouddisk.media.VideoProcessService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
@@ -36,7 +37,7 @@ public class CloudSettingController {
 
     private final TaskProgressService taskProgressService;
 
-    private final IUserService userService;
+    private final CommonUserFileService commonUserFileService;
 
     private final IAuthService authService;
 
@@ -51,7 +52,7 @@ public class CloudSettingController {
     @Permission(value = "cloud:file:upload")
     @LogOperatingFun
     public ResponseResult<Object> userSync(@RequestParam String username, String path) {
-        return rebuildIndexTaskService.sync(username, path);
+        return rebuildIndexTaskService.sync(username, path, false);
     }
 
     @Operation(summary = "重建索引-全盘")
@@ -59,7 +60,7 @@ public class CloudSettingController {
     @Permission(value = "cloud:set:sync")
     @LogOperatingFun
     public ResponseResult<Object> sync(@RequestParam String username) {
-        return rebuildIndexTaskService.sync(username, null);
+        return rebuildIndexTaskService.sync(username, null, true);
     }
 
     @Operation(summary = "重新计算文件夹大小")
@@ -128,6 +129,14 @@ public class CloudSettingController {
         return settingService.updateNetdiskName(netdiskName);
     }
 
+    @Operation(summary = "修改网盘个性化配置")
+    @PutMapping("/user/setting/update_netdisk_personalization")
+    @Permission(value = "cloud:set:sync")
+    @LogOperatingFun
+    public ResponseResult<Object> updateNetdiskPersonalization(@RequestBody NetdiskPersonalization personalization) {
+        return settingService.updateNetdiskPersonalization(personalization);
+    }
+
     @Operation(summary = "重置角色菜单")
     @PutMapping("/user/setting/resetMenuAndRole")
     @Permission(onlyCreator = true)
@@ -141,16 +150,7 @@ public class CloudSettingController {
     @GetMapping("/user/setting/get/webp")
     @Permission("sys:user:list")
     public ResponseResult<Boolean> getDisabledWebp(@RequestParam String userId) {
-        return ResultUtil.success(userService.getDisabledWebp(userId));
-    }
-
-    @Operation(summary = "是否禁用webp(默认开启)")
-    @PutMapping("/user/setting/disabled/webp")
-    @Permission("sys:user:update")
-    @LogOperatingFun
-    public ResponseResult<Object> disabledWebp(@RequestParam String userId, @RequestParam Boolean disabled) {
-        userService.disabledWebp(userId, disabled);
-        return ResultUtil.success();
+        return ResultUtil.success(commonUserFileService.getDisabledWebp(userId));
     }
 
     @Operation(summary = "加载ldap配置")
@@ -192,7 +192,7 @@ public class CloudSettingController {
 
     @Operation(summary = "加载任务进度")
     @GetMapping("/cloud/task/progress")
-    @Permission(value = "cloud:file:upload")
+    @Permission(value = "cloud:file:list")
     public ResponseResult<List<TaskProgress>> getTaskProgress() {
         return ResultUtil.success(taskProgressService.getTaskProgressList());
     }
@@ -202,6 +202,30 @@ public class CloudSettingController {
     @Permission(value = "cloud:file:upload")
     public ResponseResult<Map<String, Integer>> getTranscodeStatus() {
         return ResultUtil.success(videoProcessService.getTranscodeStatus());
+    }
+
+    @Operation(summary = "获取是否强制启用两步认证")
+    @GetMapping("/cloud/setting/mfa-force-enable")
+    public ResponseResult<Object> getMfaForceEnable() {
+        return ResultUtil.success(settingService.getMfaForceEnable());
+    }
+
+    @Operation(summary = "设置是否强制启用两步认证")
+    @LogOperatingFun(logType = LogOperation.Type.OPERATION)
+    @PutMapping("/cloud/setting/mfa-force-enable")
+    @Permission(value = "cloud:set:sync")
+    public ResponseResult<Object> setMfaForceEnable(@RequestParam Boolean mfaForceEnable) {
+        settingService.setMfaForceEnable(mfaForceEnable);
+        return ResultUtil.success();
+    }
+
+    @Operation(summary = "重置两步验证")
+    @LogOperatingFun(logType = LogOperation.Type.OPERATION)
+    @PutMapping("/cloud/setting/reset-mfa")
+    @Permission(value = "cloud:set:sync")
+    public ResponseResult<Object> resetMfa() {
+        settingService.resetMfa();
+        return ResultUtil.success();
     }
 
 }

@@ -8,20 +8,40 @@ import cn.hutool.core.io.file.PathUtil;
 import cn.hutool.core.text.CharSequenceUtil;
 import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.ReUtil;
-import cn.hutool.core.util.URLUtil;
 import cn.hutool.crypto.SecureUtil;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.jmal.clouddisk.config.FileProperties;
+import com.jmal.clouddisk.dao.IFileDAO;
+import com.jmal.clouddisk.dao.IShareDAO;
 import com.jmal.clouddisk.exception.CommonException;
 import com.jmal.clouddisk.exception.ExceptionType;
-import com.jmal.clouddisk.model.*;
-import com.jmal.clouddisk.oss.*;
+import com.jmal.clouddisk.model.OperationPermission;
+import com.jmal.clouddisk.model.ShareBaseInfoDTO;
+import com.jmal.clouddisk.model.ShareDO;
+import com.jmal.clouddisk.model.UploadApiParamDTO;
+import com.jmal.clouddisk.model.UploadResponse;
+import com.jmal.clouddisk.model.file.FileDocument;
+import com.jmal.clouddisk.model.file.FileIntroVO;
+import com.jmal.clouddisk.oss.AbstractOssObject;
+import com.jmal.clouddisk.oss.BaseOssService;
+import com.jmal.clouddisk.oss.BucketInfo;
+import com.jmal.clouddisk.oss.FileInfo;
+import com.jmal.clouddisk.oss.IOssService;
+import com.jmal.clouddisk.oss.OssConfigService;
+import com.jmal.clouddisk.oss.PlatformOSS;
 import com.jmal.clouddisk.service.Constants;
 import com.jmal.clouddisk.service.IFileVersionService;
-import com.jmal.clouddisk.service.IUserService;
-import com.jmal.clouddisk.service.impl.UserLoginHolder;
+import com.jmal.clouddisk.service.impl.CommonFileService;
+import com.jmal.clouddisk.service.impl.CommonUserFileService;
+import com.jmal.clouddisk.service.impl.CommonUserService;
+import com.jmal.clouddisk.service.impl.FileSortService;
+import com.jmal.clouddisk.service.impl.MessageService;
 import com.jmal.clouddisk.util.CaffeineUtil;
 import com.jmal.clouddisk.util.FileContentTypeUtils;
+import com.jmal.clouddisk.util.FileNameUtils;
+import com.jmal.clouddisk.util.ImageExifUtil;
+import com.jmal.clouddisk.util.MyFileUtils;
 import com.jmal.clouddisk.util.ResponseResult;
 import com.jmal.clouddisk.util.ResultUtil;
 import com.jmal.clouddisk.webdav.MyWebdavServlet;
@@ -30,11 +50,8 @@ import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.catalina.connector.ClientAbortException;
-import org.bson.Document;
 import org.jetbrains.annotations.NotNull;
-import org.springframework.data.mongodb.core.query.Criteria;
-import org.springframework.data.mongodb.core.query.Query;
-import org.springframework.data.mongodb.core.query.Update;
+import org.springframework.core.io.InputStreamResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -42,24 +59,51 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
-import java.io.*;
+import java.io.BufferedInputStream;
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 @Service
 @Slf4j
 @RequiredArgsConstructor
-public class WebOssService extends WebOssCommonService {
+public class WebOssService {
 
+    private final WebOssCommonService webOssCommonService;
+
+    private final IFileDAO fileDAO;
+
+    private final MessageService messageService;
+
+    private final CommonFileService commonFileService;
+
+    private final CommonUserFileService commonUserFileService;
+
+    private final FileProperties fileProperties;
 
     private final IFileVersionService fileVersionService;
 
-    private final UserLoginHolder userLoginHolder;
+    private final CommonUserService userService;
+
+    private final IShareDAO shareDAO;
 
     /***
      * 断点恢复上传缓存(已上传的分片缓存)
@@ -80,6 +124,12 @@ public class WebOssService extends WebOssCommonService {
     }
 
     public static String getObjectName(Path prePath, String ossPath, boolean isFolder) {
+        // 判断prePath是否为url编码过的，如果是则解码
+        String prePathStr = prePath.toString();
+        String decodedPathStr = FileNameUtils.decodeAndCheckPath(prePathStr);
+        if (!prePathStr.equals(decodedPathStr)) {
+            prePath = Paths.get(decodedPathStr);
+        }
         String name = "";
         int ossPathCount = Paths.get(ossPath).getNameCount();
         if (prePath.getNameCount() > ossPathCount) {
@@ -88,12 +138,17 @@ public class WebOssService extends WebOssCommonService {
                 name = name + "/";
             }
         }
-        return URLUtil.decode(name);
+        return FileNameUtils.decodeAndCheckPath(name);
+    }
+
+    public static String getFilenameFromObjectName(String objectName) {
+        return Paths.get(objectName).getFileName().toString();
     }
 
     public ResponseResult<Object> searchFileAndOpenOssFolder(Path prePth, UploadApiParamDTO upload) {
         String ossPath = CaffeineUtil.getOssPath(prePth);
-        commonFileService.pushMessage(upload.getUsername(), Constants.OSS_CHUNK_SIZE, Constants.UPLOADER_CHUNK_SIZE);
+        IOssService ossService = OssConfigService.getOssStorageService(ossPath);
+        messageService.pushMessage(upload.getUsername(), new Constants.UploaderOption(Constants.OSS_CHUNK_SIZE, ossService.getProxyEnabled()), Constants.UPLOADER_CHUNK_SIZE);
         if (ossPath == null) {
             return ResultUtil.success().setData(new ArrayList<>(0)).setCode(0);
         }
@@ -114,7 +169,7 @@ public class WebOssService extends WebOssCommonService {
                 userId = upload.getUserId();
             }
             if (CharSequenceUtil.isNotBlank(userId)) {
-                userId = userService.getUserIdByUserName(getUsernameByOssPath(ossPath));
+                userId = userService.getUserIdByUserName(WebOssCommonService.getUsernameByOssPath(ossPath));
             }
 
             // 过滤条件
@@ -137,17 +192,21 @@ public class WebOssService extends WebOssCommonService {
 
     /**
      * 设置附加属性
-     * @param ossPath ossPath
-     * @param upload upload
-     * @param list   list
-     * @param objectName objectName
+     *
+     * @param ossPath     ossPath
+     * @param upload      upload
+     * @param list        list
+     * @param objectName  objectName
      * @param finalUserId finalUserId
      */
     @NotNull
     private List<FileIntroVO> setAdditionalAttributes(String ossPath, UploadApiParamDTO upload, List<FileInfo> list, String objectName, String finalUserId) {
         List<FileIntroVO> fileIntroVOList;
+        if (list.isEmpty()) {
+            return List.of();
+        }
         // 检测上级目录是否有分享属性
-        Document shareBaseDocument = commonFileService.getShareBaseDocument(getPath(list.get(0).getKey(), getOssRootFolderName(ossPath)));
+        ShareBaseInfoDTO shareBaseDocument = commonUserFileService.getShareBaseDocument(finalUserId, WebOssCommonService.getPath(list.getFirst().getKey(), WebOssCommonService.getOssRootFolderName(ossPath)));
 
         List<FileDocument> fileDocumentList = getFileDocuments(ossPath, objectName);
 
@@ -156,9 +215,7 @@ public class WebOssService extends WebOssCommonService {
         List<String> fileIntroVOIds = list.stream().map(FileInfo::getKey).toList();
         List<String> deleteIds = fileDocumentIds.stream().filter(id -> !fileIntroVOIds.contains(id)).toList();
         if (!deleteIds.isEmpty()) {
-            Query query = new Query();
-            query.addCriteria(Criteria.where("id").in(deleteIds));
-            mongoTemplate.remove(query, FileDocument.class);
+            fileDAO.removeByIdIn(deleteIds);
         }
 
         // 添加fileIntroVOList里有而fileDocumentList里没有的列表
@@ -173,11 +230,11 @@ public class WebOssService extends WebOssCommonService {
             // 设置文件的额外属性:分享属性和收藏属性
             FileDocument fileDocument = fileDocumentList.stream().filter(f -> f.getId().equals(fileIntroVO.getId())).findFirst().orElse(null);
             if (shareBaseDocument != null) {
-                fileIntroVO.setIsPrivacy(Convert.toBool(shareBaseDocument.get(Constants.IS_PRIVACY), null));
-                fileIntroVO.setExpiresAt(Convert.toLong(shareBaseDocument.get(Constants.EXPIRES_AT), null));
+                fileIntroVO.setIsPrivacy(Convert.toBool(shareBaseDocument.getIsPrivacy(), null));
+                fileIntroVO.setExpiresAt(Convert.toLong(shareBaseDocument.getExpireDate(), null));
                 fileIntroVO.setIsShare(true);
-                if (shareBaseDocument.get(Constants.OPERATION_PERMISSION_LIST) != null) {
-                    List<OperationPermission> operationPermissionList = Convert.toList(OperationPermission.class, shareBaseDocument.get(Constants.OPERATION_PERMISSION_LIST));
+                if (shareBaseDocument.getOperationPermissionList() != null) {
+                    List<OperationPermission> operationPermissionList = Convert.toList(OperationPermission.class, shareBaseDocument.getOperationPermissionList());
                     fileIntroVO.setOperationPermissionList(operationPermissionList);
                 }
                 if (fileDocument == null) {
@@ -186,8 +243,8 @@ public class WebOssService extends WebOssCommonService {
                     fileDocumentToBeAdded.setExpiresAt(fileIntroVO.getExpiresAt());
                     fileDocumentToBeAdded.setIsShare(fileIntroVO.getIsShare());
                     fileDocumentToBeAdded.setOperationPermissionList(fileIntroVO.getOperationPermissionList());
-                    fileDocumentToBeAdded.setExtractionCode(Convert.toStr(shareBaseDocument.getString(Constants.EXTRACTION_CODE), null));
-                    fileDocumentToBeAdded.setShareId(Convert.toStr(shareBaseDocument.getString(Constants.SHARE_ID), null));
+                    fileDocumentToBeAdded.setExtractionCode(Convert.toStr(shareBaseDocument.getExtractionCode(), null));
+                    fileDocumentToBeAdded.setShareId(Convert.toStr(shareBaseDocument.getShareId(), null));
                     listToBeAdded.add(fileDocumentToBeAdded);
                 }
             }
@@ -204,7 +261,7 @@ public class WebOssService extends WebOssCommonService {
 
         // 添加fileIntroVOList里有而fileDocumentList里没有的列表
         if (!listToBeAdded.isEmpty()) {
-            mongoTemplate.insertAll(listToBeAdded);
+            fileDAO.saveAll(listToBeAdded);
         }
         return fileIntroVOList;
     }
@@ -220,14 +277,13 @@ public class WebOssService extends WebOssCommonService {
         if (!objectName.isEmpty() && !objectName.endsWith("/")) {
             return new ArrayList<>();
         }
-        Query query = new Query();
         String parentName = Paths.get(objectName).getFileName().toString();
-        String path = getPath(objectName, getOssRootFolderName(ossPath));
+        String path = WebOssCommonService.getPath(objectName, WebOssCommonService.getOssRootFolderName(ossPath));
         if (!parentName.isEmpty()) {
             path += parentName + MyWebdavServlet.PATH_DELIMITER;
         }
-        query.addCriteria(Criteria.where("path").is(path));
-        return mongoTemplate.find(query, FileDocument.class);
+        String userId = userService.getUserIdByUserName(WebOssCommonService.getUsernameByOssPath(ossPath));
+        return fileDAO.findByPath(userId, path);
     }
 
     private static List<FileInfo> filterOther(UploadApiParamDTO upload, List<FileInfo> fileInfoList) {
@@ -247,7 +303,7 @@ public class WebOssService extends WebOssCommonService {
             String sortableProp = upload.getSortableProp();
             // 按文件大小排序
             if ("size".equals(sortableProp)) {
-                if ("descending".equals(order)) {
+                if (Constants.DESCENDING.equals(order)) {
                     // 倒序
                     fileIntroVOList = fileIntroVOList.stream().sorted(commonFileService::compareBySizeDesc).toList();
                 } else {
@@ -257,7 +313,7 @@ public class WebOssService extends WebOssCommonService {
             }
             // 按文件最近修改时间排序
             if (Constants.UPDATE_DATE.equals(sortableProp)) {
-                if ("descending".equals(order)) {
+                if (Constants.DESCENDING.equals(order)) {
                     // 倒序
                     fileIntroVOList = fileIntroVOList.stream().sorted(commonFileService::compareByUpdateDateDesc).toList();
                 } else {
@@ -267,7 +323,7 @@ public class WebOssService extends WebOssCommonService {
             }
         }
         // 默认按文件排序
-        fileIntroVOList = commonFileService.sortByFileName(upload, fileIntroVOList, order);
+        fileIntroVOList = FileSortService.sortByFileName(upload.getSortableProp(), fileIntroVOList, order);
         return fileIntroVOList;
     }
 
@@ -289,7 +345,7 @@ public class WebOssService extends WebOssCommonService {
             FileIntroVO fileIntroVO = new FileIntroVO();
             FileInfo fileInfo = abstractOssObject.getFileInfo();
             if (fileInfo != null && inputStream != null) {
-                String userId = userService.getUserIdByUserName(getUsernameByOssPath(ossPath));
+                String userId = userService.getUserIdByUserName(WebOssCommonService.getUsernameByOssPath(ossPath));
                 fileIntroVO = fileInfo.toFileIntroVO(ossPath, userId);
                 if (BooleanUtil.isTrue(content)) {
                     String context = IoUtil.read(inputStream, StandardCharsets.UTF_8);
@@ -314,7 +370,7 @@ public class WebOssService extends WebOssCommonService {
                 String line;
                 while ((line = bufferedReader.readLine()) != null) {
                     outputStream.write(line.getBytes(StandardCharsets.UTF_8));
-                    outputStream.write("\n".getBytes(StandardCharsets.UTF_8));
+                    outputStream.write(Constants.NEWLINE);
                     outputStream.flush();
                 }
             } catch (IOException e) {
@@ -342,7 +398,7 @@ public class WebOssService extends WebOssCommonService {
         String objectName = getObjectName(prePth, ossPath, false);
         String uploadId = ossService.getUploadId(objectName);
         // 已上传的分片号
-        List<Integer> chunks = LIST_PARTS_CACHE.get(uploadId, key -> ossService.getListParts(objectName, uploadId));
+        List<Integer> chunks = LIST_PARTS_CACHE.get(uploadId, _ -> ossService.getListParts(objectName, uploadId));
         // 返回已存在的分片
         uploadResponse.setResume(chunks);
         assert chunks != null;
@@ -351,9 +407,9 @@ public class WebOssService extends WebOssCommonService {
             ossService.completeMultipartUpload(objectName, uploadId, upload.getTotalSize());
             // 清除缓存
             removeListPartsCache(uploadId);
-            notifyCreateFile(upload.getUsername(), objectName, getOssRootFolderName(ossPath));
+            webOssCommonService.notifyCreateFile(upload.getUsername(), objectName, WebOssCommonService.getOssRootFolderName(ossPath));
             FileDocument fileDocument = getFileDocumentByOssPath(ossPath, upload, objectName);
-            afterUploadComplete(objectName, ossPath, fileDocument);
+            webOssCommonService.afterUploadComplete(objectName, ossPath, fileDocument);
         }
         uploadResponse.setUpload(true);
         return uploadResponse;
@@ -373,9 +429,9 @@ public class WebOssService extends WebOssCommonService {
         ossService.completeMultipartUpload(objectName, ossService.getUploadId(objectName), upload.getTotalSize());
         // 清除缓存
         removeListPartsCache(uploadId);
-        notifyCreateFile(upload.getUsername(), objectName, getOssRootFolderName(ossPath));
+        webOssCommonService.notifyCreateFile(upload.getUsername(), objectName, WebOssCommonService.getOssRootFolderName(ossPath));
         FileDocument fileDocument = getFileDocumentByOssPath(ossPath, upload, objectName);
-        afterUploadComplete(objectName, ossPath, fileDocument);
+        webOssCommonService.afterUploadComplete(objectName, ossPath, fileDocument);
         uploadResponse.setUpload(true);
         return uploadResponse;
     }
@@ -403,15 +459,15 @@ public class WebOssService extends WebOssCommonService {
             try (InputStream inputStream = file.getInputStream()) {
                 ossService.uploadFile(inputStream, objectName, currentChunkSize);
             }
-            notifyCreateFile(upload.getUsername(), objectName, getOssRootFolderName(ossPath));
+            webOssCommonService.notifyCreateFile(upload.getUsername(), objectName, WebOssCommonService.getOssRootFolderName(ossPath));
             FileDocument fileDocument = getFileDocumentByOssPath(ossPath, upload, objectName);
-            afterUploadComplete(objectName, ossPath, fileDocument);
+            webOssCommonService.afterUploadComplete(objectName, ossPath, fileDocument);
         } else {
             // 上传分片
             String uploadId = ossService.getUploadId(objectName);
 
             // 已上传的分片号列表
-            CopyOnWriteArrayList<Integer> chunks = LIST_PARTS_CACHE.get(uploadId, key -> ossService.getListParts(objectName, uploadId));
+            CopyOnWriteArrayList<Integer> chunks = LIST_PARTS_CACHE.get(uploadId, _ -> ossService.getListParts(objectName, uploadId));
 
             // 上传本次的分片
             boolean success = ossService.uploadPart(file.getInputStream(), objectName, currentChunkSize, upload.getChunkNumber(), uploadId);
@@ -439,9 +495,9 @@ public class WebOssService extends WebOssCommonService {
         IOssService ossService = OssConfigService.getOssStorageService(ossPath);
         String objectName = getObjectName(prePth, ossPath, true);
         ossService.mkdir(objectName);
-        String username = getUsernameByOssPath(ossPath);
-        notifyCreateFile(username, objectName, getOssRootFolderName(ossPath));
-        afterUploadComplete(objectName, ossPath, null);
+        String username = WebOssCommonService.getUsernameByOssPath(ossPath);
+        webOssCommonService.notifyCreateFile(username, objectName, WebOssCommonService.getOssRootFolderName(ossPath));
+        webOssCommonService.afterUploadComplete(objectName, ossPath, null);
         return ossPath.substring(1) + MyWebdavServlet.PATH_DELIMITER + objectName;
     }
 
@@ -465,13 +521,13 @@ public class WebOssService extends WebOssCommonService {
             throw new CommonException(ExceptionType.SYSTEM_ERROR.getCode(), "重命名失败");
         }
         // 修改历史文件中的filename
-        String username = getUsernameByOssPath(ossPath);
-        String sourceFileId = getFileId(getOssRootFolderName(ossPath), objectName, username);
-        String destinationFileId = getFileId(getOssRootFolderName(ossPath), destinationObjectName, username);
+        String username = WebOssCommonService.getUsernameByOssPath(ossPath);
+        String sourceFileId = WebOssCommonService.getFileId(WebOssCommonService.getOssRootFolderName(ossPath), objectName, username);
+        String destinationFileId = WebOssCommonService.getFileId(WebOssCommonService.getOssRootFolderName(ossPath), destinationObjectName, username);
         fileVersionService.rename(sourceFileId, destinationFileId);
         // 通知文件创建成功
-        notifyCreateFile(getUsernameByOssPath(ossPath), objectName, getOssRootFolderName(ossPath));
-        String rootFolderName = getOssRootFolderName(ossPath);
+        webOssCommonService.notifyCreateFile(WebOssCommonService.getUsernameByOssPath(ossPath), objectName, WebOssCommonService.getOssRootFolderName(ossPath));
+        String rootFolderName = WebOssCommonService.getOssRootFolderName(ossPath);
         Path fromPath = Paths.get(rootFolderName, objectName);
         Path toPath = Paths.get(rootFolderName, destinationObjectName);
         commonFileService.pushMessageOperationFileSuccess(fromPath.toString(), toPath.toString(), operator, "重命名");
@@ -482,15 +538,13 @@ public class WebOssService extends WebOssCommonService {
         // 删除临时文件，如果有的话
         deleteTemp(ossPath, objectName);
         // 检查该目录是否有其他依赖的缓存等等。。
-        Query query = new Query();
-        query.addCriteria(Criteria.where("_id").regex("^" + pathName));
-        List<FileDocument> fileDocumentList = mongoTemplate.findAllAndRemove(query, FileDocument.class);
+        List<FileDocument> fileDocumentList = fileDAO.findAllAndRemoveByIdPrefix(pathName);
         String newFullPathName = newFilePath.toString();
         if (isFolder) {
             newFullPathName += MyWebdavServlet.PATH_DELIMITER;
         }
         // 修改关联的分享文件
-        String username = getUsernameByOssPath(ossPath);
+        String username = WebOssCommonService.getUsernameByOssPath(ossPath);
         String newPathName = newFullPathName.substring(username.length());
         String oldPath = pathName.substring(username.length());
         List<FileDocument> newList = new ArrayList<>();
@@ -506,12 +560,10 @@ public class WebOssService extends WebOssCommonService {
             newList.add(fileDocument);
         }
         if (!newList.isEmpty()) {
-            mongoTemplate.insertAll(newList);
+            fileDAO.saveAll(newList);
         }
         // 修改关联的分享配置
-        Query shareQuery = new Query();
-        shareQuery.addCriteria(Criteria.where(Constants.FILE_ID).regex("^" + pathName));
-        List<ShareDO> shareDOList = mongoTemplate.findAllAndRemove(shareQuery, ShareDO.class);
+        List<ShareDO> shareDOList = shareDAO.findAllAndRemoveByFileIdPrefix(pathName);
         List<ShareDO> newShareDOList = new ArrayList<>();
         for (ShareDO shareDO : shareDOList) {
             String oldFileId = shareDO.getFileId();
@@ -523,12 +575,10 @@ public class WebOssService extends WebOssCommonService {
             newShareDOList.add(shareDO);
         }
         if (!newShareDOList.isEmpty()) {
-            mongoTemplate.insertAll(newShareDOList);
+            shareDAO.saveAll(newShareDOList);
         }
         // 修改关联的挂载文件
-        Query mountQuery = new Query();
-        mountQuery.addCriteria(Criteria.where("mountFileId").regex("^" + pathName));
-        List<FileDocument> mountFileDocumentList = mongoTemplate.findAllAndRemove(mountQuery, FileDocument.class);
+        List<FileDocument> mountFileDocumentList = fileDAO.findAllAndRemoveByMountFileIdPrefix(pathName);
         List<FileDocument> newMountFileDocumentList = new ArrayList<>();
         for (FileDocument fileDocument : mountFileDocumentList) {
             String oldMountFileId = fileDocument.getMountFileId();
@@ -540,7 +590,7 @@ public class WebOssService extends WebOssCommonService {
             newMountFileDocumentList.add(fileDocument);
         }
         if (!newMountFileDocumentList.isEmpty()) {
-            mongoTemplate.insertAll(newMountFileDocumentList);
+            fileDAO.saveAll(newMountFileDocumentList);
         }
     }
 
@@ -565,31 +615,26 @@ public class WebOssService extends WebOssCommonService {
             if (ossService.delete(objectName)) {
                 // 删除文件历史版本，如果有的话
                 deleteHistory(ossPath, objectName);
-                notifyDeleteFile(ossPath, objectName);
+                webOssCommonService.notifyDeleteFile(ossPath, objectName);
                 // 删除临时文件，如果有的话
                 deleteTemp(ossPath, objectName);
                 // 删除依赖，如果有的话
-                Query query = new Query();
-                query.addCriteria(Criteria.where("_id").regex("^" + ReUtil.escape(pathName)));
-                List<FileDocument> fileDocumentList = mongoTemplate.findAllAndRemove(query, FileDocument.class);
-                Query shareQuery = new Query();
-                List<String> fileIds = fileDocumentList.stream().map(FileBase::getId).toList();
-                shareQuery.addCriteria(Criteria.where(Constants.FILE_ID).in(fileIds));
-                mongoTemplate.remove(shareQuery, ShareDO.class);
+                List<String> fileIds = fileDAO.findIdsAndRemoveByIdPrefix(pathName);
+                shareDAO.removeByFileIdIn(fileIds);
             }
         }
     }
 
     private void deleteHistory(String ossPath, String objectName) {
-        String username = getUsernameByOssPath(ossPath);
-        String fileId = getFileId(getOssRootFolderName(ossPath), objectName, username);
+        String username = WebOssCommonService.getUsernameByOssPath(ossPath);
+        String fileId = WebOssCommonService.getFileId(WebOssCommonService.getOssRootFolderName(ossPath), objectName, username);
         fileVersionService.deleteAll(fileId);
     }
 
-    public ResponseEntity<Object> thumbnail(String ossPath, String pathName) {
+    public ResponseEntity<InputStreamResource> thumbnail(String ossPath, String pathName) {
         Optional<FileDocument> file = Optional.empty();
-        FileDocument fileDocument = mongoTemplate.findById(pathName, FileDocument.class);
-        if (fileDocument != null && fileDocument.getContent() != null) {
+        FileDocument fileDocument = fileDAO.findThumbnailContentInputStreamById(pathName);
+        if (fileDocument != null && fileDocument.getInputStream() != null) {
             file = Optional.of(fileDocument);
         } else {
             IOssService ossService = OssConfigService.getOssStorageService(ossPath);
@@ -597,30 +642,26 @@ public class WebOssService extends WebOssCommonService {
             String tempFileName = SecureUtil.md5(pathName) + Paths.get(pathName).getFileName();
             File tempFile = Paths.get(fileProperties.getRootDir(), fileProperties.getChunkFileDir(), tempFileName).toFile();
             try {
-                FileInfo fileInfo = ossService.getThumbnail(objectName, tempFile, 256);
-                String username = getUsernameByOssPath(ossPath);
-                FileDocument thumbnailDoc = fileInfo.toFileDocument(ossPath, userService.getUserIdByUserName(username));
-                thumbnailDoc.setContent(FileUtil.readBytes(tempFile));
-                if (fileDocument != null) {
-                    Query query = new Query().addCriteria(Criteria.where("_id").is(pathName));
-                    Update update = new Update();
-                    update.set("content", thumbnailDoc.getContent());
-                    mongoTemplate.upsert(query, update, FileDocument.class);
+                FileDocument thumbnailDoc = new FileDocument();
+                String suffix = MyFileUtils.extName(tempFile);
+                String contentType = FileContentTypeUtils.getContentType(suffix);
+                if (ImageExifUtil.isImageType(contentType, suffix)) {
+                    InputStream inputStream = ossService.getThumbnail(objectName, 256);
+                    thumbnailDoc.setInputStream(inputStream);
                 } else {
-                    mongoTemplate.save(thumbnailDoc);
+                    AbstractOssObject abstractOssObject = ossService.getAbstractOssObject(objectName);
+                    if (abstractOssObject != null) {
+                        thumbnailDoc.setContentType(contentType);
+                        thumbnailDoc.setInputStream(abstractOssObject.getInputStream());
+                        thumbnailDoc.setSize(abstractOssObject.getContentLength());
+                    }
                 }
-                if (thumbnailDoc.getContent() != null) {
-                    file = Optional.of(thumbnailDoc);
-                }
+                file = Optional.of(thumbnailDoc);
             } catch (Exception e) {
                 log.error(e.getMessage(), e);
-            } finally {
-                if (tempFile.exists()) {
-                    FileUtil.del(tempFile);
-                }
             }
         }
-        return file.map(commonFileService::getObjectResponseEntity).orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND).body("找不到该文件"));
+        return file.map(commonFileService::getImageInputStreamResourceEntity).orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND).build());
     }
 
     public FileIntroVO addFile(String ossPath, Boolean isFolder, Path prePth) {
@@ -647,10 +688,10 @@ public class WebOssService extends WebOssCommonService {
                 fileInfo = BaseOssService.newFileInfo(objectName, bucketInfo.getBucketName(), tempFileAbsolutePath.toFile());
                 Files.delete(tempFileAbsolutePath);
             }
-            notifyCreateFile(path.subpath(0, 1).toString(), objectName, bucketInfo.getFolderName());
-            String username = getUsernameByOssPath(ossPath);
+            webOssCommonService.notifyCreateFile(path.subpath(0, 1).toString(), objectName, bucketInfo.getFolderName());
+            String username = WebOssCommonService.getUsernameByOssPath(ossPath);
             FileDocument fileDocument = fileInfo.toFileDocument(ossPath, userService.getUserIdByUserName(username));
-            afterUploadComplete(objectName, ossPath, fileDocument);
+            webOssCommonService.afterUploadComplete(objectName, ossPath, fileDocument);
         } catch (IOException e) {
             log.error(e.getMessage(), e);
             throw new CommonException(ExceptionType.SYSTEM_ERROR.getCode(), "新建文件失败");
@@ -660,29 +701,47 @@ public class WebOssService extends WebOssCommonService {
     }
 
     public void putObjectText(String ossPath, Path prePth, String contentText) {
-        IOssService ossService = OssConfigService.getOssStorageService(ossPath);
-        String objectName = getObjectName(prePth, ossPath, false);
+        byte[] contentBytes = contentText.getBytes(StandardCharsets.UTF_8);
+        putObject(ossPath, prePth, new ByteArrayInputStream(contentBytes), contentBytes.length);
+    }
 
-        try (AbstractOssObject abstractOssObject = ossService.getAbstractOssObject(objectName)) {
-            // 修改文件之前保存历史版本
-            String username = getUsernameByOssPath(ossPath);
-            if (!username.equals(userLoginHolder.getUsername())) {
-                throw new CommonException(ExceptionType.PERMISSION_DENIED);
-            }
-            String fileId = getFileId(getOssRootFolderName(ossPath), objectName, username);
-            fileVersionService.saveFileVersion(abstractOssObject, fileId);
-        } catch (IOException e) {
-            log.error(e.getMessage(), e);
+
+    public void putOfficeCallback(String ossPath, Path prePth, File file, long size) throws IOException {
+        putObject(ossPath, prePth, new FileInputStream(file), size);
+    }
+
+    public void putObject(String ossPath, Path prePth, InputStream inputStream, long size) {
+        try {
+            IOssService ossService = OssConfigService.getOssStorageService(ossPath);
+            String objectName = getObjectName(prePth, ossPath, false);
+            ossService.write(inputStream, ossPath, objectName, size);
+            FileInfo fileInfo = ossService.getFileInfo(objectName);
+            webOssCommonService.notifyUpdateFile(ossPath, objectName, fileInfo);
+        } finally {
+            IoUtil.close(inputStream);
         }
+    }
 
-        InputStream inputStream = new ByteArrayInputStream(CharSequenceUtil.bytes(contentText, StandardCharsets.UTF_8));
-        ossService.write(inputStream, ossPath, objectName);
-        notifyUpdateFile(ossPath, objectName, contentText.length());
+    public static String getPresignedUrl(String ossPath, Path prePth, boolean isDownload) {
+        IOssService ossService = OssConfigService.getOssStorageService(ossPath);
+        String objectName = WebOssService.getObjectName(prePth, ossPath, false);
+        return getPresignedUrl(ossService, objectName, isDownload);
+    }
+
+    private static String getPresignedUrl(IOssService ossService, String objectName, boolean isDownload) {
+        return ossService.getPresignedObjectUrl(objectName, 3600, isDownload);
     }
 
     public void download(String ossPath, Path prePth, HttpServletRequest request, HttpServletResponse response, String downloadFilename) {
         IOssService ossService = OssConfigService.getOssStorageService(ossPath);
         String objectName = getObjectName(prePth, ossPath, false);
+        if (BooleanUtil.isFalse(ossService.getProxyEnabled())) {
+            // 通过307重定向到oss直链下载
+            String presignedUrl = getPresignedUrl(ossService, objectName, CharSequenceUtil.isNotBlank(downloadFilename));
+            response.setStatus(HttpServletResponse.SC_TEMPORARY_REDIRECT);
+            response.setHeader("Location", presignedUrl);
+            return;
+        }
         try (AbstractOssObject abstractOssObject = ossService.getAbstractOssObject(objectName);
              InputStream inputStream = abstractOssObject.getInputStream();
              InputStream inStream = new BufferedInputStream(inputStream, 2048);
@@ -699,7 +758,7 @@ public class WebOssService extends WebOssCommonService {
             String range = request.getHeader(HttpHeaders.RANGE);
             if (CharSequenceUtil.isNotBlank(range)) {
                 // 处理 Range 请求
-                handlerRange(response, ossService, objectName, outputStream, encodedFilename, fileSize, range);
+                handlerRange(response, ossService, objectName, outputStream, fileSize, range);
             } else {
                 response.setStatus(HttpServletResponse.SC_OK);
                 response.setContentLengthLong(fileSize);
@@ -715,15 +774,14 @@ public class WebOssService extends WebOssCommonService {
     /**
      * 处理 Range 请求
      *
-     * @param response        HttpServletResponse
-     * @param ossService      IOssService
-     * @param objectName      objectName
-     * @param outputStream    response OutputStream
-     * @param encodedFilename 编码后的文件名
-     * @param fileSize        文件总大小
-     * @param range           header range 的 值
+     * @param response     HttpServletResponse
+     * @param ossService   IOssService
+     * @param objectName   objectName
+     * @param outputStream response OutputStream
+     * @param fileSize     文件总大小
+     * @param range        header range 的 值
      */
-    private void handlerRange(HttpServletResponse response, IOssService ossService, String objectName, OutputStream outputStream, String encodedFilename, long fileSize, String range) {
+    private void handlerRange(HttpServletResponse response, IOssService ossService, String objectName, OutputStream outputStream, long fileSize, String range) {
         long[] ranges = parseRange(range, fileSize);
         long start = ranges[0];
         long end = ranges[1] == -1 ? fileSize - 1 : ranges[1];
@@ -763,23 +821,6 @@ public class WebOssService extends WebOssCommonService {
         }
     }
 
-    public FileDocument getFileDocumentByOssPath(String ossPath, String pathName) {
-        IOssService ossService = OssConfigService.getOssStorageService(ossPath);
-        String objectName = pathName.substring(ossPath.length());
-        try (AbstractOssObject abstractOssObject = ossService.getAbstractOssObject(objectName)) {
-            if (abstractOssObject == null) {
-                return null;
-            }
-            FileInfo fileInfo = abstractOssObject.getFileInfo();
-            String username = getUsernameByOssPath(ossPath);
-            String userId = userService.getUserIdByUserName(username);
-            return fileInfo.toFileDocument(ossPath, userId);
-        } catch (Exception e) {
-            log.error(e.getMessage(), e);
-        }
-        return null;
-    }
-
     /**
      * 设置ossPath所关联的FileDocument
      *
@@ -800,7 +841,7 @@ public class WebOssService extends WebOssCommonService {
             fileDocumentListOld.addAll(fileDocumentList);
             List<FileDocument> newFileDocumentList = fileDocumentListOld.stream().distinct().toList();
             // 插入oss目录下的共享文件
-            mongoTemplate.insertAll(newFileDocumentList);
+            fileDAO.saveAll(newFileDocumentList);
         }
     }
 
@@ -814,16 +855,13 @@ public class WebOssService extends WebOssCommonService {
      * @param unSetShare  移除 share 属性
      */
     public List<FileDocument> removeOssPathFile(String userId, String fileId, String ossPath, boolean ossRootPath, boolean unSetShare) {
-        Query query = new Query();
-        query.addCriteria(Criteria.where(IUserService.USER_ID).is(userId));
         String path;
         if (ossRootPath) {
             path = ossPath.substring(1);
         } else {
             path = fileId;
         }
-        query.addCriteria(Criteria.where("_id").regex("^" + ReUtil.escape(path)));
-        List<FileDocument> fileDocumentList = mongoTemplate.findAllAndRemove(query, FileDocument.class);
+        List<FileDocument> fileDocumentList = fileDAO.findAllAndRemoveByUserIdAndIdPrefix(userId, ReUtil.escape(path));
         List<FileDocument> list = new ArrayList<>();
         for (FileDocument fileDocument : fileDocumentList) {
             if (unSetShare) {
@@ -835,7 +873,7 @@ public class WebOssService extends WebOssCommonService {
                 fileDocument.setShareBase(null);
             }
             // 如果 favorite 和 share 属性都没有了就过滤掉
-            if (BooleanUtil.isFalse(fileDocument.getIsFavorite()) && fileDocument.getIsShare() == null) {
+            if (!BooleanUtil.isTrue(fileDocument.getIsFavorite()) && fileDocument.getIsShare() == null) {
                 continue;
             }
             list.add(fileDocument);

@@ -1,10 +1,11 @@
 package com.jmal.clouddisk.model;
 
+import com.jmal.clouddisk.config.Reflective;
 import com.jmal.clouddisk.util.TimeUntils;
 import lombok.Data;
+import lombok.NoArgsConstructor;
 
 import java.time.LocalDateTime;
-import java.util.Date;
 
 /**
  * @Description 归档展示
@@ -12,7 +13,8 @@ import java.util.Date;
  * @Date 2020/11/15 7:33 下午
  */
 @Data
-public class ArchivesVO {
+@NoArgsConstructor
+public class ArchivesVO implements Reflective {
 
     /***
      * 归档id
@@ -23,21 +25,29 @@ public class ArchivesVO {
      */
     private String name;
     /***
-     * 显示时间
-     */
-    private Date date;
-    /***
      * 归档缩略名
      */
     private String slug;
+    /***
+     * 显示时间
+     */
+    private LocalDateTime date;
+
+    private String day;
 
     public String date(){
-        LocalDateTime localDateTime = date.toInstant().atZone(TimeUntils.ZONE_ID).toLocalDateTime();
-        return localDateTime.format(TimeUntils.DATE_MONTH);
+        return date.format(TimeUntils.DATE_MONTH);
     }
 
     public String dateTime(){
-        LocalDateTime localDateTime = date.toInstant().atZone(TimeUntils.ZONE_ID).toLocalDateTime();
-        return localDateTime.format(TimeUntils.DATE_DAY);
+        return date.format(TimeUntils.DATE_DAY);
+    }
+
+    public ArchivesVO(String id, String name, String slug, LocalDateTime date) {
+        this.id = id;
+        this.name = name;
+        this.slug = slug;
+        this.date = date;
+        this.day = date.format(TimeUntils.FORMAT_FILE_MONTH);
     }
 }

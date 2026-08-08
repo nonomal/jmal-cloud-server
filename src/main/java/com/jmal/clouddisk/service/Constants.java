@@ -1,24 +1,41 @@
 package com.jmal.clouddisk.service;
 
+import com.jmal.clouddisk.config.Reflective;
+
+import java.nio.charset.StandardCharsets;
+import java.util.regex.Pattern;
+
 public class Constants {
+
+    public static final byte[] NEWLINE = "\n".getBytes(StandardCharsets.UTF_8);
+    public static final Pattern ANSI_PATTERN = Pattern.compile("\u001B\\[[;\\d]*m");
 
     public static final String NEEDS_ETAG_UPDATE_FIELD = "needsEtagUpdate";
     public static final String LAST_ETAG_UPDATE_REQUEST_AT_FIELD = "lastEtagUpdateRequestAt";
     public static final String ETAG_UPDATE_FAILED_ATTEMPTS_FIELD = "etagUpdateFailedAttempts";
     public static final String LAST_ETAG_UPDATE_ERROR_FIELD = "lastEtagUpdateError";
+    public static final int MAX_CONCURRENT_PROCESSING_NUMBER = 6;
+    public static final String LOGO_NAME_PREFIX = "logo-";
+    public static String MOUNT_FILE_ID_FIELD = "mountFileId";
 
-    private Constants() { }
+    private Constants() {
+    }
 
     public static final String CONTENT_TYPE = "contentType";
     public static final String SUFFIX = "suffix";
     public static final String RELEASE = "release";
     public static final String ALONE_PAGE = "alonePage";
-    public static final String DRAFT = "draft";
+    public static final String CONTENT_DRAFT = "draft";
+    public static final String CONTENT_TEXT = "contentText";
+    public static final String CONTENT = "content";
+    public static final String HISTORY = "history";
+    public static final String CONTENT_HTML = "html";
     public static final String IS_FOLDER = "isFolder";
     public static final String IS_FAVORITE = "isFavorite";
     public static final String TAG_IDS = "tagIds";
     public static final String TOTAL_SIZE = "totalSize"; //totalSize
     public static final String ETAG = "etag";
+    public static final String NO_CONTENT_ETAG = "no_content_etag";
     public static final String PATH_FIELD = "path";
     public static final String FILENAME_FIELD = "name";
 
@@ -26,7 +43,6 @@ public class Constants {
     public static final String REGION_DEFAULT = "0";
     public static final String EXTRACTION_CODE = "extractionCode";
     public static final String IS_PRIVACY = "isPrivacy";
-    public static final String EXPIRE_DATE = "expireDate";
     public static final String OPERATION_PERMISSION_LIST = "operationPermissionList";
     public static final String SHARE_ID = "shareId";
     public static final String FATHER_SHARE_ID = "fatherShareId";
@@ -48,18 +64,17 @@ public class Constants {
 
     public static final String OCR_LITE_ONNX = "OcrLiteOnnx";
 
-    public static final String HEIF_CONVERT = "heif-convert";
-
     public static final String DOCUMENT = "document";
 
     public static final String OTHER = "other";
 
     public static final String CONTENT_TYPE_IMAGE = "image";
     public static final String CONTENT_TYPE_MARK_DOWN = "text/markdown";
-    public static final String CONTENT_TYPE_WEBP = "image/webp";
     public static final String SUFFIX_WEBP = "webp";
     public static final String POINT_SUFFIX_WEBP = ".webp";
 
+    public static final String DESCENDING = "descending";
+    public static final String ASCENDING = "ascending";
     public static final String CREATE_TIME = "createTime";
     public static final String UPLOAD_DATE = "uploadDate";
 
@@ -77,6 +92,8 @@ public class Constants {
 
     public static final String SIZE = "size";
 
+    public static final String CHILDREN_COUNT = "childrenCount";
+
     public static final String DELETE_FILE = "deleteFile";
 
     public static final String UPDATE_FILE = "updateFile";
@@ -87,12 +104,14 @@ public class Constants {
 
     public static final String OPERATION_TIPS = "operationTips";
 
+    public record UploaderOption(Integer chunkSize, Boolean proxyEnabled) implements Reflective {}
+
     public static final String UPLOADER_CHUNK_SIZE = "uploaderChunkSize";
 
     public static final int OSS_CHUNK_SIZE = 5 * 1024 * 1024;
 
     public static final int LOCAL_CHUNK_SIZE = 1024 * 1024;
 
-    public static final String MXWEB_SUFFIX =  ".mxweb";
+    public final static String VO_KEY = "****************";
 
 }

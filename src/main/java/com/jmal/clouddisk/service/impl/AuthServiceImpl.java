@@ -2,8 +2,10 @@ package com.jmal.clouddisk.service.impl;
 
 import cn.hutool.core.date.LocalDateTimeUtil;
 import cn.hutool.core.text.CharSequenceUtil;
+import cn.hutool.core.thread.ThreadUtil;
 import cn.hutool.core.util.BooleanUtil;
 import com.jmal.clouddisk.controller.record.LoginResponse;
+import com.jmal.clouddisk.dao.ILdapConfigDAO;
 import com.jmal.clouddisk.exception.CommonException;
 import com.jmal.clouddisk.exception.ExceptionType;
 import com.jmal.clouddisk.interceptor.AuthInterceptor;
@@ -14,11 +16,11 @@ import com.jmal.clouddisk.model.rbac.ConsumerDTO;
 import com.jmal.clouddisk.service.IAuthService;
 import com.jmal.clouddisk.service.IUserService;
 import com.jmal.clouddisk.util.*;
-import jakarta.annotation.PostConstruct;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
-import org.springframework.data.mongodb.core.MongoTemplate;
-import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.context.event.ContextRefreshedEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.ldap.AuthenticationException;
 import org.springframework.ldap.CommunicationException;
 import org.springframework.ldap.core.AttributesMapper;
@@ -26,6 +28,7 @@ import org.springframework.ldap.core.LdapTemplate;
 import org.springframework.ldap.core.support.LdapContextSource;
 import org.springframework.ldap.query.LdapQuery;
 import org.springframework.ldap.query.LdapQueryBuilder;
+import org.springframework.security.crypto.encrypt.TextEncryptor;
 import org.springframework.stereotype.Service;
 
 import java.util.HashMap;
@@ -41,7 +44,7 @@ import java.util.regex.Pattern;
 @RequiredArgsConstructor
 public class AuthServiceImpl implements IAuthService {
 
-    private final MongoTemplate mongoTemplate;
+    private final ILdapConfigDAO ldapConfigDAO;
 
     private LdapTemplate ldapTemplate;
 
@@ -57,16 +60,26 @@ public class AuthServiceImpl implements IAuthService {
 
     private final TotpService totpService;
 
+    private final TextEncryptor textEncryptor;
+
+    private final SettingService settingService;
+
     public String loginError() {
         return messageUtil.getMessage("login.error");
     }
 
-    @PostConstruct
-    private void init() {
-        LdapConfigDO ldapConfigDO = mongoTemplate.findOne(new Query(), LdapConfigDO.class);
+    @EventListener(ContextRefreshedEvent.class)
+    public void onApplicationReady(ContextRefreshedEvent event) {
+        if (event.getApplicationContext().getParent() != null) {
+            return;
+        }
+        ThreadUtil.execute(this::init);
+    }
+
+    public void init() {
+        LdapConfigDO ldapConfigDO = ldapConfigDAO.findOne();
         if (ldapConfigDO != null) {
-            ConsumerDO consumerDO = userService.getUserInfoById(ldapConfigDO.getUserId());
-            LdapConfigDTO ldapConfigDTO = ldapConfigDO.toLdapConfigDTO(consumerDO);
+            LdapConfigDTO ldapConfigDTO = ldapConfigDO.toLdapConfigDTO(textEncryptor);
             LdapContextSource ldapContextSource = loadLdapConfig(ldapConfigDTO);
             ldapTemplate = new LdapTemplate(ldapContextSource);
             ldapEnable = ldapConfigDTO.getEnable();
@@ -91,13 +104,13 @@ public class AuthServiceImpl implements IAuthService {
     }
 
     @Override
-    public ResponseResult<Object> login(HttpServletResponse response, ConsumerDTO consumerDTO) {
+    public ResponseResult<Object> login(HttpServletRequest request, HttpServletResponse response, ConsumerDTO consumerDTO) {
         String password = consumerDTO.getPassword();
         ConsumerDO consumerDO = userService.getUserInfoByUsername(consumerDTO.getUsername());
         if (consumerDO == null) {
             if (ldapTemplate != null && BooleanUtil.isTrue(ldapEnable)) {
                 // ldap登录
-                return ldapLogin(response, consumerDTO);
+                return ldapLogin(request, response, consumerDTO);
             }
             return ResultUtil.error(loginError());
         } else {
@@ -106,34 +119,69 @@ public class AuthServiceImpl implements IAuthService {
                 // 密码正确, 检查MFA状态
                 if (BooleanUtil.isTrue(consumerDO.getMfaEnabled())) {
                     // 需要MFA验证。生成一个短期的、有范围的“预授权Token”
-                    String mfaToken = TokenUtil.createToken(consumerDTO.getUsername(), hashPassword, LocalDateTimeUtil.now().plusMinutes(5));
+                    String mfaToken = getMfaToken(consumerDTO, hashPassword);
                     return ResultUtil.success(new LoginResponse(null, true, mfaToken));
                 } else {
-                    // 无需MFA，直接登录成功
-                    return loginValidSuccess(response, consumerDTO, consumerDO);
+                    // 检查是否强制启用多因素认证
+                    if (settingService.getMfaForceEnable()) {
+                        String mfaToken = getMfaToken(consumerDTO, hashPassword);
+                        return ResultUtil.success(new LoginResponse(true, null, mfaToken));
+                    } else {
+                        // 无需MFA，直接登录成功
+                        return loginValidSuccess(request, response, consumerDTO, consumerDO);
+                    }
                 }
             }
         }
         return ResultUtil.error(loginError());
     }
 
+    private static String getMfaToken(ConsumerDTO consumerDTO, String hashPassword) {
+        return TokenUtil.createToken(consumerDTO.getUsername(), hashPassword, LocalDateTimeUtil.now().plusMinutes(5));
+    }
+
     @Override
-    public ResponseResult<Object> verifyTotp(HttpServletResponse response, ConsumerDTO consumerDTO) {
+    public ResponseResult<Object> verifyTotp(HttpServletRequest request, HttpServletResponse response, ConsumerDTO consumerDTO) {
+        // 验证预授权Token
+        ResponseResult<Object> result = verifyMafToken(consumerDTO);
+        if (result != null) return result;
+        // 验证TOTP码
+        if (totpService.isCodeInvalid(consumerDTO.getMfaCode(), consumerDTO.getUsername())) {
+            return ResultUtil.error(messageUtil.getMessage("login.mfaError"));
+        }
+        ConsumerDO consumerDO = userService.getUserInfoByUsername(consumerDTO.getUsername());
+        return loginValidSuccess(request, response, consumerDTO, consumerDO);
+    }
+
+    @Override
+    public ResponseResult<Object> initVerifyTotp(HttpServletRequest request, HttpServletResponse response, ConsumerDTO consumerDTO) {
+        // 验证预授权Token
+        ResponseResult<Object> result = verifyMafToken(consumerDTO);
+        if (result != null) return result;
+
+        // 使用前端传回的secret和用户输入的code进行验证
+        if (!totpService.isRawCodeValid(consumerDTO.getMfaSecret(), consumerDTO.getMfaCode())) {
+            return ResultUtil.error(messageUtil.getMessage("login.mfaError"));
+        }
+
+        // 验证成功！将密钥与用户绑定并启用MFA
+        userService.enableMfa(userService.getUserIdByUserName(consumerDTO.getUsername()), consumerDTO.getMfaSecret());
+
+        ConsumerDO consumerDO = userService.getUserInfoByUsername(consumerDTO.getUsername());
+        return loginValidSuccess(request, response, consumerDTO, consumerDO);
+    }
+
+    private ResponseResult<Object> verifyMafToken(ConsumerDTO consumerDTO) {
         // 验证预授权Token
         String hashPassword = userService.getHashPasswordUserName(consumerDTO.getUsername());
         String username = TokenUtil.getTokenKey(consumerDTO.getMfaToken(), hashPassword);
         if (CharSequenceUtil.isBlank(username) || !consumerDTO.getUsername().equals(username)) {
             return ResultUtil.error(messageUtil.getMessage("login.mfaError"));
         }
-        // 验证TOTP码
-        if (totpService.isCodeInvalid(consumerDTO.getMfaCode(), consumerDTO.getUsername())) {
-            return ResultUtil.error(messageUtil.getMessage("login.mfaError"));
-        }
-        ConsumerDO consumerDO = userService.getUserInfoByUsername(consumerDTO.getUsername());
-        return loginValidSuccess(response, consumerDTO, consumerDO);
+        return null;
     }
 
-    private static ResponseResult<Object> loginValidSuccess(HttpServletResponse response, ConsumerDTO userDTO, ConsumerDO consumerDO) {
+    private static ResponseResult<Object> loginValidSuccess(HttpServletRequest request, HttpServletResponse response, ConsumerDTO userDTO, ConsumerDO consumerDO) {
         Map<String, String> map = new HashMap<>(3);
         String username = userDTO.getUsername();
         String hashPassword = consumerDO.getPassword();
@@ -142,24 +190,24 @@ public class AuthServiceImpl implements IAuthService {
         map.put(AuthInterceptor.JMAL_TOKEN, jmalToken);
         map.put(IUserService.USERNAME, username);
         map.put(IUserService.USER_ID, consumerDO.getId());
-        AuthInterceptor.setRefreshCookie(response, hashPassword, username, rememberMe, jmalToken);
+        AuthInterceptor.setRefreshCookie(request, response, hashPassword, username, rememberMe, jmalToken);
         return ResultUtil.success(map);
     }
 
-    private ResponseResult<Object> ldapLogin(HttpServletResponse response, ConsumerDTO consumerDTO) {
+    private ResponseResult<Object> ldapLogin(HttpServletRequest request, HttpServletResponse response, ConsumerDTO consumerDTO) {
         try {
             LdapQuery query = LdapQueryBuilder.query().where(ldapLoginName).is(consumerDTO.getUsername());
             ldapTemplate.authenticate(query, consumerDTO.getPassword());
         } catch (Exception e) {
             return ResultUtil.error(loginError());
         }
-        LdapConfigDO ldapConfigDO = mongoTemplate.findOne(new Query(), LdapConfigDO.class);
+        LdapConfigDO ldapConfigDO = ldapConfigDAO.findOne();
         if (ldapConfigDO != null) {
             // 创建账号
             consumerDTO.setRoles(ldapConfigDO.getDefaultRoleList());
             consumerDTO.setShowName(consumerDTO.getUsername());
             ConsumerDO consumerDO = userService.add(consumerDTO);
-            return loginValidSuccess(response, consumerDTO, consumerDO);
+            return loginValidSuccess(request, response, consumerDTO, consumerDO);
         }
         return ResultUtil.error(loginError());
     }
@@ -187,13 +235,13 @@ public class AuthServiceImpl implements IAuthService {
         String username = userLoginHolder.getUsername();
         CaffeineUtil.removeAuthoritiesCache(username);
         CaffeineUtil.removeUserIdCache(username);
-        AuthInterceptor.removeCookies(response, IUserService.USERNAME, AuthInterceptor.JMAL_TOKEN, AuthInterceptor.REFRESH_TOKEN);
+        AuthInterceptor.removeCookies(response, IUserService.USERNAME, AuthInterceptor.JMAL_TOKEN, AuthInterceptor.REFRESH_TOKEN, AuthInterceptor.REMEMBER_NAME);
         return ResultUtil.success();
     }
 
     @Override
     public ResponseResult<Object> validOldPass(String userId, String password) {
-        ConsumerDO user = mongoTemplate.findById(userId, ConsumerDO.class, UserServiceImpl.COLLECTION_NAME);
+        ConsumerDO user = userService.userInfoById(userId);
         if (user == null) {
             return ResultUtil.warning(loginError());
         } else {
@@ -212,11 +260,11 @@ public class AuthServiceImpl implements IAuthService {
         // 判断操作用户是否为网盘创建者
         String userId = userLoginHolder.getUserId();
         ConsumerDO consumerDO = userService.userInfoById(userId);
-        if (BooleanUtil.isFalse(consumerDO.getCreator())) {
+        if (!BooleanUtil.isTrue(consumerDO.getCreator())) {
             throw new CommonException(ExceptionType.PERMISSION_DENIED);
         }
-        LdapConfigDO ldapConfigDO = ldapConfigDTO.toLdapConfigDO(consumerDO);
-        mongoTemplate.save(ldapConfigDO);
+        LdapConfigDO ldapConfigDO = ldapConfigDTO.toLdapConfigDO(consumerDO.getId(), textEncryptor);
+        ldapConfigDAO.save(ldapConfigDO);
         // 重新加载ldap配置
         init();
         return ResultUtil.success();
@@ -243,7 +291,7 @@ public class AuthServiceImpl implements IAuthService {
 
     @Override
     public LdapConfigDTO loadLdapConfig() {
-        LdapConfigDO ldapConfigDO = mongoTemplate.findOne(new Query(), LdapConfigDO.class);
+        LdapConfigDO ldapConfigDO = ldapConfigDAO.findOne();
         if (ldapConfigDO == null) {
             return null;
         }

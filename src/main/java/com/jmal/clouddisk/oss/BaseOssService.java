@@ -3,7 +3,7 @@ package com.jmal.clouddisk.oss;
 import cn.hutool.core.io.FileUtil;
 import cn.hutool.core.io.file.PathUtil;
 import cn.hutool.core.text.CharSequenceUtil;
-import cn.hutool.core.thread.ThreadUtil;
+import cn.hutool.core.util.BooleanUtil;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.jmal.clouddisk.config.FileProperties;
@@ -12,6 +12,9 @@ import com.jmal.clouddisk.exception.ExceptionType;
 import com.jmal.clouddisk.oss.web.model.OssConfigDTO;
 import com.jmal.clouddisk.util.FileContentTypeUtils;
 import com.jmal.clouddisk.webdav.MyWebdavServlet;
+import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.schedulers.Schedulers;
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.File;
@@ -77,9 +80,13 @@ public class BaseOssService {
 
     private final IOssService ossService;
 
+    @Getter
+    private final Boolean proxyEnabled;
+
     public BaseOssService(IOssService ossService, String bucketName, FileProperties fileProperties, ScheduledThreadPoolExecutor scheduledThreadPoolExecutor, OssConfigDTO ossConfigDTO) {
         this.ossService = ossService;
         this.bucketName = bucketName;
+        this.proxyEnabled = BooleanUtil.isTrue(ossConfigDTO.getProxyEnabled());
         this.fileProperties = fileProperties;
         scheduledThreadPoolExecutor.scheduleWithFixedDelay(this::checkUpload, 1, 1, TimeUnit.SECONDS);
         this.fileInfoListCache = Caffeine.newBuilder().initialCapacity(128).maximumSize(1024).expireAfterWrite(5, TimeUnit.SECONDS).build();
@@ -198,7 +205,7 @@ public class BaseOssService {
     }
 
     public List<FileInfo> getFileInfoListCache(String objectName) {
-        return fileInfoListCache.get(objectName, key -> {
+        return fileInfoListCache.get(objectName, _ -> {
             List<FileInfo> fileInfos = ossService.getFileInfoList(objectName);
             if (fileInfos != null && !fileInfos.isEmpty()) {
                 for (FileInfo fileInfo : fileInfos) {
@@ -234,7 +241,7 @@ public class BaseOssService {
      * @param objectName objectName
      */
     private void onDeleteSuccess(String objectName) {
-        log.info("delete success: {}", objectName);
+        log.debug("delete success: {}", objectName);
         FileInfo fileInfo = getFileInfoCache(objectName);
         if (fileInfo != null) {
             clearFileCache(objectName);
@@ -277,11 +284,11 @@ public class BaseOssService {
      * @param tempFileAbsolutePath 临时文件绝对路径
      */
     public void onUploadSuccess(String objectName, Path tempFileAbsolutePath) {
-        clearTempFileCache(objectName);
+        log.debug("put file success: {}", objectName);
         setFileInfoCache(objectName, newFileInfo(objectName, tempFileAbsolutePath.toFile()));
+        clearTempFileCache(objectName);
         clearFileListCache(objectName);
         removeWaitingUploadCache(objectName);
-        printSuccess(objectName);
     }
 
     /**
@@ -290,15 +297,11 @@ public class BaseOssService {
      * @param fileSize 文件大小
      */
     public void onUploadSuccess(String objectName, Long fileSize) {
-        clearTempFileCache(objectName);
+        log.debug("upload file success: {}", objectName);
         setFileInfoCache(objectName, newFileInfo(objectName, fileSize));
+        clearTempFileCache(objectName);
         clearFileListCache(objectName);
         removeWaitingUploadCache(objectName);
-        printSuccess(objectName);
-    }
-
-    private static void printSuccess(String objectName) {
-        log.info("upload success: {}", objectName);
     }
 
     /**
@@ -307,7 +310,7 @@ public class BaseOssService {
      * @param fileInfo FileInfo
      */
     private void onMkdirSuccess(String objectName, FileInfo fileInfo) {
-        log.info("mkdir success: {}", objectName);
+        log.debug("mkdir success: {}", objectName);
         setFileInfoCache(objectName, fileInfo);
         clearFileListCache(objectName);
     }
@@ -355,12 +358,19 @@ public class BaseOssService {
      * 该方法每秒执行一次 <br/>
      */
     private void checkUpload() {
+        if (waitingUploadCache.estimatedSize() < 1) {
+            return;
+        }
         getWaitingUploadCacheMap().forEach((objectName, tempFileAbsolutePath) -> {
             long lastModified = tempFileAbsolutePath.toFile().lastModified();
             // 临时文件的最后修改时间大于5秒就上传
             if ((System.currentTimeMillis() - lastModified) > 5000) {
                 removeWaitingUploadCache(objectName);
-                ThreadUtil.execute(() -> ossService.uploadFile(tempFileAbsolutePath, objectName));
+                Completable.fromAction(() -> ossService.uploadFile(tempFileAbsolutePath, objectName))
+                        .subscribeOn(Schedulers.io())
+                        .doOnError(e -> log.error(e.getMessage(), e))
+                        .onErrorComplete()
+                        .subscribe();
             }
         });
     }
@@ -458,7 +468,7 @@ public class BaseOssService {
     }
 
     public void printOperation(String platform, String operation, String objectName) {
-        log.info("{}, {}, {}", platform, operation, objectName);
+        log.debug("{}, {}, {}", platform, operation, objectName);
     }
 
     /**
@@ -561,6 +571,6 @@ public class BaseOssService {
     }
 
     public void closePrint() {
-        log.info("platform: {}, bucketName: {} shutdown... {}", this.ossService.getPlatform().getValue(), bucketName, this.ossService.hashCode());
+        log.debug("platform: {}, bucketName: {} shutdown... {}", this.ossService.getPlatform().getValue(), bucketName, this.ossService.hashCode());
     }
 }

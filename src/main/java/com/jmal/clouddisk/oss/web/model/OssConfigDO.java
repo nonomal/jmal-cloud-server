@@ -1,23 +1,31 @@
 package com.jmal.clouddisk.oss.web.model;
 
-import com.jmal.clouddisk.model.rbac.ConsumerDO;
+import com.jmal.clouddisk.config.Reflective;
+import com.jmal.clouddisk.config.jpa.AuditableTimeEntity;
 import com.jmal.clouddisk.oss.OssConfigService;
 import com.jmal.clouddisk.oss.PlatformOSS;
-import com.jmal.clouddisk.service.impl.UserServiceImpl;
-import lombok.Data;
+import com.jmal.clouddisk.service.Constants;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Table;
+import lombok.Getter;
+import lombok.Setter;
 import org.springframework.data.mongodb.core.index.CompoundIndex;
 import org.springframework.data.mongodb.core.mapping.Document;
+import org.springframework.security.crypto.encrypt.TextEncryptor;
 
 /**
  * @author jmal
  * @Description oss 配置
  * @date 2023/4/4 16:08
  */
-@Data
+@Getter
+@Setter
 @Document(collection = OssConfigService.COLLECTION_NAME)
 @CompoundIndex(name = "userId_1", def = "{'userId': 1}")
-public class OssConfigDO {
-    private String id;
+@Entity
+@Table(name = "oss_config")
+public class OssConfigDO extends AuditableTimeEntity implements Reflective {
     private PlatformOSS platform;
     private String folderName;
     private String endpoint;
@@ -25,9 +33,18 @@ public class OssConfigDO {
     private String secretKey;
     private String region;
     private String bucket;
+    @Column(length = 24)
     private String userId;
+    /**
+     * 是否启用路径风格访问以访问S3对象，而非DNS风格访问
+     */
+    private Boolean pathStyleAccessEnabled;
+    /**
+     * 是否启用 S3 代理功能, 启用后上传下载流量会通过jmalcloud服务中转, 默认关闭
+     */
+    private Boolean proxyEnabled;
 
-    public OssConfigDTO toOssConfigDTO(ConsumerDO consumerDO) {
+    public OssConfigDTO toOssConfigDTO(TextEncryptor textEncryptor) {
         OssConfigDTO ossConfigDTO = new OssConfigDTO();
         ossConfigDTO.setEndpoint(this.endpoint);
         ossConfigDTO.setBucket(this.bucket);
@@ -35,8 +52,10 @@ public class OssConfigDO {
         ossConfigDTO.setPlatform(this.platform.name());
         ossConfigDTO.setRegion(this.region);
         ossConfigDTO.setUserId(this.userId);
-        ossConfigDTO.setAccessKey(UserServiceImpl.getDecryptStrByUser(this.accessKey, consumerDO));
-        ossConfigDTO.setSecretKey(UserServiceImpl.getDecryptStrByUser(this.secretKey, consumerDO));
+        ossConfigDTO.setAccessKey(textEncryptor.decrypt(accessKey));
+        ossConfigDTO.setSecretKey(textEncryptor.decrypt(secretKey));
+        ossConfigDTO.setPathStyleAccessEnabled(this.pathStyleAccessEnabled);
+        ossConfigDTO.setProxyEnabled(this.proxyEnabled);
         return ossConfigDTO;
     }
 
@@ -49,6 +68,10 @@ public class OssConfigDO {
         ossConfigDTO.setPlatform(this.platform.getKey());
         ossConfigDTO.setRegion(this.region);
         ossConfigDTO.setUserId(this.userId);
+        ossConfigDTO.setProxyEnabled(this.proxyEnabled);
+        ossConfigDTO.setPathStyleAccessEnabled(this.pathStyleAccessEnabled);
+        ossConfigDTO.setAccessKey(Constants.VO_KEY);
+        ossConfigDTO.setSecretKey(Constants.VO_KEY);
         return ossConfigDTO;
     }
 }

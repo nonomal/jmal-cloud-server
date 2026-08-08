@@ -1,25 +1,73 @@
 package com.jmal.clouddisk.oss.aliyun;
 
+import cn.hutool.core.date.LocalDateTimeUtil;
 import cn.hutool.core.io.file.PathUtil;
+import cn.hutool.core.text.CharSequenceUtil;
 import cn.hutool.core.thread.ThreadUtil;
 import com.aliyun.oss.ClientException;
+import com.aliyun.oss.HttpMethod;
 import com.aliyun.oss.OSS;
 import com.aliyun.oss.OSSClientBuilder;
 import com.aliyun.oss.OSSException;
-import com.aliyun.oss.model.*;
+import com.aliyun.oss.model.AbortMultipartUploadRequest;
+import com.aliyun.oss.model.CompleteMultipartUploadRequest;
+import com.aliyun.oss.model.CopyObjectRequest;
+import com.aliyun.oss.model.CopyObjectResult;
+import com.aliyun.oss.model.DeleteObjectsRequest;
+import com.aliyun.oss.model.DeleteVersionsRequest;
+import com.aliyun.oss.model.GeneratePresignedUrlRequest;
+import com.aliyun.oss.model.GetObjectRequest;
+import com.aliyun.oss.model.InitiateMultipartUploadRequest;
+import com.aliyun.oss.model.InitiateMultipartUploadResult;
+import com.aliyun.oss.model.ListMultipartUploadsRequest;
+import com.aliyun.oss.model.ListObjectsRequest;
+import com.aliyun.oss.model.ListPartsRequest;
+import com.aliyun.oss.model.ListVersionsRequest;
+import com.aliyun.oss.model.MultipartUpload;
+import com.aliyun.oss.model.MultipartUploadListing;
+import com.aliyun.oss.model.OSSObject;
+import com.aliyun.oss.model.OSSObjectSummary;
+import com.aliyun.oss.model.OSSVersionSummary;
+import com.aliyun.oss.model.ObjectListing;
+import com.aliyun.oss.model.ObjectMetadata;
+import com.aliyun.oss.model.PartETag;
+import com.aliyun.oss.model.PartListing;
+import com.aliyun.oss.model.PartSummary;
+import com.aliyun.oss.model.PutObjectRequest;
+import com.aliyun.oss.model.PutObjectResult;
+import com.aliyun.oss.model.ResponseHeaderOverrides;
+import com.aliyun.oss.model.UploadPartCopyRequest;
+import com.aliyun.oss.model.UploadPartCopyResult;
+import com.aliyun.oss.model.UploadPartRequest;
+import com.aliyun.oss.model.VersionListing;
 import com.jmal.clouddisk.config.FileProperties;
-import com.jmal.clouddisk.oss.*;
+import com.jmal.clouddisk.exception.CommonException;
+import com.jmal.clouddisk.model.GridFSBO;
+import com.jmal.clouddisk.model.Metadata;
+import com.jmal.clouddisk.oss.AbstractOssObject;
+import com.jmal.clouddisk.oss.BaseOssService;
+import com.jmal.clouddisk.oss.FileInfo;
+import com.jmal.clouddisk.oss.IOssService;
+import com.jmal.clouddisk.oss.PartInfo;
+import com.jmal.clouddisk.oss.PlatformOSS;
+import com.jmal.clouddisk.oss.S3ObjectSummary;
 import com.jmal.clouddisk.oss.web.model.OssConfigDTO;
+import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.schedulers.Schedulers;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
 
 import java.io.ByteArrayInputStream;
-import java.io.File;
 import java.io.InputStream;
-import java.net.URL;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 
@@ -43,12 +91,20 @@ public class AliyunOssService implements IOssService {
         this.ossClient = new OSSClientBuilder().build(endpoint, accessKeyId, accessKeySecret);
         scheduledThreadPoolExecutor = ThreadUtil.createScheduledExecutor(1);
         this.baseOssService = new BaseOssService(this, bucketName, fileProperties, scheduledThreadPoolExecutor, ossConfigDTO);
-        ThreadUtil.execute(this::getMultipartUploads);
+        Completable.fromAction(this::getMultipartUploads).subscribeOn(Schedulers.io())
+                .doOnError(e -> log.error(e.getMessage(), e))
+                .onErrorComplete()
+                .subscribe();
     }
 
     @Override
     public PlatformOSS getPlatform() {
         return PlatformOSS.ALIYUN;
+    }
+
+    @Override
+    public Boolean getProxyEnabled() {
+        return baseOssService.getProxyEnabled();
     }
 
     @Override
@@ -72,6 +128,11 @@ public class AliyunOssService implements IOssService {
     }
 
     @Override
+    public boolean write(InputStream inputStream, String ossPath, String objectName, long size) {
+        return uploadFile(inputStream, objectName, size);
+    }
+
+    @Override
     public String[] list(String objectName) {
         return baseOssService.getFileNameList(objectName).toArray(new String[0]);
     }
@@ -83,16 +144,88 @@ public class AliyunOssService implements IOssService {
 
     @Override
     public AbstractOssObject getAbstractOssObject(String objectName) {
-        return getAbstractOssObject(objectName, null, null);
+        return getAbstractOssObject(objectName, null, null, null);
+    }
+
+    @Override
+    public AbstractOssObject getAbstractOssObject(String objectName, String versionId) {
+        return getAbstractOssObject(objectName, versionId, null, null);
+    }
+
+    @Override
+    public Page<GridFSBO> listObjectVersions(String objectName, Integer pageSize, Integer pageIndex) {
+
+        List<GridFSBO> allVersions = new ArrayList<>();
+        String nextMarker = null;
+
+        int skipCount = (pageIndex - 1) * pageSize;
+        int totalCount = 0;
+        boolean hasMore = true;
+        String versionIdMarker = null;
+
+        VersionListing versionListing;
+        while (hasMore) {
+            ListVersionsRequest listVersionsRequest = new ListVersionsRequest()
+                    .withBucketName(bucketName)
+                    .withPrefix(objectName)
+                    .withKeyMarker(nextMarker)
+                    .withVersionIdMarker(versionIdMarker);
+            versionListing = ossClient.listVersions(listVersionsRequest);
+            if (!versionListing.getVersionSummaries().isEmpty()) {
+                for (var version : versionListing.getVersionSummaries()) {
+                    if (version.getKey().equals(objectName)) {
+                        totalCount++;
+                        // 跳过前面的页，收集当前页的数据
+                        if (totalCount > skipCount && allVersions.size() < pageSize) {
+                            allVersions.add(getGridFSBO(version));
+                        }
+                    }
+                }
+            }
+            // 检查是否还有更多数据
+            if (versionListing.isTruncated()) {
+                nextMarker = versionListing.getNextKeyMarker();
+                versionIdMarker = versionListing.getNextVersionIdMarker();
+            } else {
+                hasMore = false;
+            }
+
+            // 如果已经收集够当前页的数据，且不需要统计总数，可以提前退出
+            if (allVersions.size() >= pageSize && !versionListing.isTruncated()) {
+                break;
+            }
+        }
+        return new PageImpl<>(allVersions, PageRequest.of(pageIndex - 1, pageSize), totalCount);
+    }
+
+    private static GridFSBO getGridFSBO(OSSVersionSummary versionSummary) {
+        String objectName = versionSummary.getKey();
+        String filename = Path.of(objectName).getFileName().toString();
+        GridFSBO gridFSBO = new GridFSBO();
+        gridFSBO.setId(versionSummary.getVersionId());
+        gridFSBO.setUploadDate(LocalDateTimeUtil.of(versionSummary.getLastModified()));
+        Metadata metadata = new Metadata();
+        metadata.setSize(versionSummary.getSize());
+        metadata.setFilename(filename);
+        metadata.setTime(LocalDateTimeUtil.format(gridFSBO.getUploadDate(), "yyyy-MM-dd HH:mm:ss"));
+        gridFSBO.setMetadata(metadata);
+        return gridFSBO;
     }
 
     @Override
     public AbstractOssObject getAbstractOssObject(String objectName, Long rangeStart, Long rangeEnd) {
+        return  getAbstractOssObject(objectName, null, rangeStart, rangeEnd);
+    }
+
+    private AbstractOssObject getAbstractOssObject(String objectName, String versionId, Long rangeStart, Long rangeEnd) {
         OSSObject ossObject = null;
         try {
             GetObjectRequest getObjectRequest = new GetObjectRequest(bucketName, objectName);
             if (rangeStart != null && rangeEnd != null) {
                 getObjectRequest.setRange(rangeStart, rangeEnd);
+            }
+            if (versionId != null) {
+                getObjectRequest.setVersionId(versionId);
             }
             ossObject = this.ossClient.getObject(getObjectRequest);
         } catch (Exception e) {
@@ -107,14 +240,71 @@ public class AliyunOssService implements IOssService {
 
     @Override
     public boolean deleteObject(String objectName) {
+        return deleteObjectVersion(objectName, null);
+    }
+
+    @Override
+    public boolean deleteObject(String objectName, String versionId) {
+        return deleteObjectVersion(objectName, versionId);
+    }
+
+    @Override
+    public void restoreVersion(String objectName, String versionId) {
+        // 复制指定版本到当前版本
+        try {
+            CopyObjectRequest copyObjectRequest = new CopyObjectRequest(bucketName, objectName, versionId, bucketName, objectName);
+            CopyObjectResult result = ossClient.copyObject(copyObjectRequest);
+            if (!result.getResponse().isSuccessful()) {
+                throw new CommonException(result.getResponse().getErrorResponseAsString());
+            }
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            throw new CommonException(e.getMessage());
+        }
+    }
+
+    private boolean deleteObjectVersion(String objectName, String versionId) {
         try {
             baseOssService.printOperation(getPlatform().getKey(), "deleteObject", objectName);
-            ossClient.deleteObject(bucketName, objectName);
+            if (CharSequenceUtil.isNotBlank(versionId)) {
+                ossClient.deleteVersion(bucketName, objectName, versionId);
+            } else {
+                deletePermanent(objectName);
+            }
         } catch (Exception e) {
             log.error(e.getMessage(), e);
             return false;
         }
         return true;
+    }
+
+    /**
+     * 永久删除对象, 删除对象的所有版本（包括删除标记）
+     * @param objectName 对象名称
+     */
+    private void deletePermanent(String objectName) {
+        List<DeleteVersionsRequest.KeyVersion> keyVersions = new ArrayList<>();
+        String nextKeyMarker = null;
+        String nextVersionIdMarker = null;
+        VersionListing versionListing;
+        do {
+            ListVersionsRequest listVersionsRequest = new ListVersionsRequest(bucketName, objectName, nextKeyMarker, nextVersionIdMarker, null, 1000);
+            versionListing = ossClient.listVersions(listVersionsRequest);
+            for (OSSVersionSummary vs : versionListing.getVersionSummaries()) {
+                if (vs.getKey().equals(objectName)) {
+                    keyVersions.add(new DeleteVersionsRequest.KeyVersion(vs.getKey(), vs.getVersionId()));
+                }
+            }
+            nextKeyMarker = versionListing.getNextKeyMarker();
+            nextVersionIdMarker = versionListing.getNextVersionIdMarker();
+        } while (versionListing.isTruncated());
+
+        if (!keyVersions.isEmpty()) {
+            DeleteVersionsRequest deleteVersionsRequest = new DeleteVersionsRequest(bucketName);
+            deleteVersionsRequest.setKeys(keyVersions);
+            deleteVersionsRequest.setQuiet(true);
+            ossClient.deleteVersions(deleteVersionsRequest);
+        }
     }
 
     @Override
@@ -339,7 +529,22 @@ public class AliyunOssService implements IOssService {
     }
 
     @Override
-    public FileInfo getThumbnail(String objectName, File file, int width) {
+    public void completeMultipartUploadWithParts(String objectName, String uploadId, List<PartInfo> partInfoList, Long fileTotalSize) {
+        baseOssService.printOperation(getPlatform().getKey(), "completeMultipartUploadWithParts", objectName);
+        List<PartETag> partETags = new ArrayList<>();
+        for (PartInfo partInfo : partInfoList) {
+            partETags.add(new PartETag(partInfo.getPartNumber(), partInfo.getEtag()));
+        }
+        // 创建CompleteMultipartUploadRequest对象。
+        CompleteMultipartUploadRequest completeMultipartUploadRequest =
+                new CompleteMultipartUploadRequest(bucketName, objectName, uploadId, partETags);
+        // 完成分片上传。
+        ossClient.completeMultipartUpload(completeMultipartUploadRequest);
+        baseOssService.onUploadSuccess(objectName, fileTotalSize);
+    }
+
+    @Override
+    public InputStream getThumbnail(String objectName, int width) {
         try {
             // 将图片缩放为固定宽高100 px。
             String style = "image/resize,m_mfit,w_" + width;
@@ -347,8 +552,7 @@ public class AliyunOssService implements IOssService {
             request.setProcess(style);
             // 将处理后的图片命名为example-resize.jpg并保存到本地。
             // 如果未指定本地路径只填写了本地文件名称（例如example-resize.jpg），则文件默认保存到示例程序所属项目对应本地路径中。
-            ossClient.getObject(request, file);
-            return baseOssService.getFileInfo(objectName);
+            return ossClient.getObject(request).getObjectContent();
         } catch (OSSException oe) {
             log.error(oe.getMessage(), oe);
         } catch (ClientException ce) {
@@ -407,21 +611,23 @@ public class AliyunOssService implements IOssService {
     }
 
     @Override
-    public void uploadFile(InputStream inputStream, String objectName, long inputStreamLength) {
+    public boolean uploadFile(InputStream inputStream, String objectName, long inputStreamLength) {
         try {
             baseOssService.printOperation(getPlatform().getKey(), "uploadFile inputStream", objectName);
             ObjectMetadata objectMetadata = new ObjectMetadata();
             objectMetadata.setContentLength(inputStreamLength);
             // 创建PutObjectRequest对象。
-            PutObjectRequest putObjectRequest = new PutObjectRequest(bucketName, objectName, inputStream, objectMetadata );
+            PutObjectRequest putObjectRequest = new PutObjectRequest(bucketName, objectName, inputStream, objectMetadata);
             // 创建PutObject请求。
             ossClient.putObject(putObjectRequest);
             baseOssService.onUploadSuccess(objectName, inputStreamLength);
+            return true;
         } catch (OSSException oe) {
             log.error(oe.getMessage(), oe);
         } catch (ClientException ce) {
             log.error(ce.getMessage(), ce);
         }
+        return false;
     }
 
     public List<String> copyObject(String sourceKey, String destinationKey) {
@@ -516,17 +722,71 @@ public class AliyunOssService implements IOssService {
     }
 
     @Override
-    public URL getPresignedObjectUrl(String objectName, int expiryTime) {
+    public String getPresignedObjectUrl(String objectName, int expiryTime, boolean isDownload) {
         try {
             Date expirationDate = new Date(System.currentTimeMillis() + expiryTime * 1000L);
+            GeneratePresignedUrlRequest generatePresignedUrlRequest = new GeneratePresignedUrlRequest(bucketName, objectName, HttpMethod.GET);
+            generatePresignedUrlRequest.setExpiration(expirationDate);
+            if (isDownload) {
+                String downloadFileName = Path.of(objectName).getFileName().toString();
+                String contentDisposition = "attachment; filename=\"" + downloadFileName + "\"";
+                String contentType = baseOssService.getContentType(objectName);
+                ResponseHeaderOverrides responseHeaderOverrides = new ResponseHeaderOverrides();
+                responseHeaderOverrides.setContentDisposition(contentDisposition);
+                responseHeaderOverrides.setContentType(contentType);
+                generatePresignedUrlRequest.setResponseHeaders(responseHeaderOverrides);
+            }
             // 生成以GET方法访问的签名URL，访客可以直接通过浏览器访问相关内容。
-            return ossClient.generatePresignedUrl(bucketName, objectName, expirationDate);
+            return ossClient.generatePresignedUrl(generatePresignedUrlRequest).toString();
         } catch (OSSException oe) {
             log.error(oe.getMessage(), oe);
         } catch (ClientException ce) {
             log.error(ce.getMessage(), ce);
         }
         return null;
+    }
+
+    @Override
+    public String getPresignedPutUrl(String objectName, String contentType, int expiryTime) {
+        try {
+            Date expirationDate = new Date(System.currentTimeMillis() + expiryTime * 1000L);
+            GeneratePresignedUrlRequest generatePresignedUrlRequest = new GeneratePresignedUrlRequest(bucketName, objectName, com.aliyun.oss.HttpMethod.PUT);
+            generatePresignedUrlRequest.setExpiration(expirationDate);
+            if (contentType != null) {
+                generatePresignedUrlRequest.setContentType(contentType);
+            }
+            return ossClient.generatePresignedUrl(generatePresignedUrlRequest).toString();
+        } catch (OSSException oe) {
+            log.error(oe.getMessage(), oe);
+        } catch (ClientException ce) {
+            log.error(ce.getMessage(), ce);
+        }
+        return null;
+    }
+
+    @Override
+    public Map<Integer, String> getPresignedUploadPartUrls(String objectName, String uploadId, int totalParts, int expiryTime) {
+        Map<Integer, String> urlMap = new HashMap<>(totalParts);
+        for (int partNumber = 1; partNumber <= totalParts; partNumber++) {
+            try {
+                Date expirationDate = new Date(System.currentTimeMillis() + expiryTime * 1000L);
+                Map<String, String> params = new LinkedHashMap<>();
+                params.put("uploadId", uploadId);
+                params.put("partNumber", String.valueOf(partNumber));
+
+                GeneratePresignedUrlRequest request = new GeneratePresignedUrlRequest(bucketName, objectName, HttpMethod.PUT);
+                request.setExpiration(expirationDate);
+                request.setQueryParameter(params);
+                String url = ossClient.generatePresignedUrl(request).toString();
+                if (url != null) {
+                    urlMap.put(partNumber, url);
+                }
+            } catch (Exception e) {
+                log.error("Error generating presigned upload part URL for: {}", objectName, e);
+                return null;
+            }
+        }
+        return urlMap;
     }
 
     @Override

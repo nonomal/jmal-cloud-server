@@ -1,11 +1,11 @@
 package com.jmal.clouddisk.oss.web.model;
 
+import com.jmal.clouddisk.config.Reflective;
 import com.jmal.clouddisk.oss.PlatformOSS;
-import com.jmal.clouddisk.service.impl.UserServiceImpl;
 import io.swagger.v3.oas.annotations.media.Schema;
-import lombok.Data;
-
 import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+import org.springframework.security.crypto.encrypt.TextEncryptor;
 
 /**
  * @author jmal
@@ -14,7 +14,7 @@ import jakarta.validation.constraints.NotNull;
  */
 @Data
 @Schema
-public class OssConfigDTO {
+public class OssConfigDTO implements Reflective {
 
     @NotNull(message = "platform 不能为空")
     @Schema(name = "platform", title = "platform", requiredMode = Schema.RequiredMode.REQUIRED, example = "aliyun")
@@ -44,16 +44,27 @@ public class OssConfigDTO {
     @Schema(hidden = true)
     private String id;
 
-    public OssConfigDO toOssConfigDO(String password) {
-        OssConfigDO ossConfigDO = new OssConfigDO();
+    @Schema(name = "pathStyleAccessEnabled", title = "pathStyleAccessEnabled", description = "启用路径风格访问以访问S3对象，而非DNS风格访问")
+    private Boolean pathStyleAccessEnabled;
+
+    @Schema(name = "proxyEnabled", title = "proxyEnabled", description = "是否启用 S3 代理功能, 启用后上传下载流量会通过jmalcloud服务中转, 默认关闭")
+    private Boolean proxyEnabled;
+
+    public OssConfigDO toOssConfigDO(OssConfigDO ossConfigDO, TextEncryptor textEncryptor) {
         ossConfigDO.setEndpoint(this.endpoint);
         ossConfigDO.setPlatform(PlatformOSS.getPlatform(this.platform));
         ossConfigDO.setFolderName(this.folderName);
         ossConfigDO.setBucket(this.bucket);
         ossConfigDO.setRegion(this.region);
         ossConfigDO.setUserId(this.userId);
-        ossConfigDO.setAccessKey(UserServiceImpl.getEncryptPwd(this.accessKey, password));
-        ossConfigDO.setSecretKey(UserServiceImpl.getEncryptPwd(this.secretKey, password));
+        ossConfigDO.setProxyEnabled(this.proxyEnabled);
+        ossConfigDO.setPathStyleAccessEnabled(this.pathStyleAccessEnabled);
+        ossConfigDO.setAccessKey(textEncryptor.encrypt(accessKey));
+        ossConfigDO.setSecretKey(textEncryptor.encrypt(secretKey));
         return ossConfigDO;
+    }
+
+    public OssConfigDO toOssConfigDO(TextEncryptor textEncryptor) {
+        return toOssConfigDO(new OssConfigDO(), textEncryptor);
     }
 }

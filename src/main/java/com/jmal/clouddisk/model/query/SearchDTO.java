@@ -2,6 +2,7 @@ package com.jmal.clouddisk.model.query;
 
 import cn.hutool.core.text.CharSequenceUtil;
 import cn.hutool.core.util.BooleanUtil;
+import com.jmal.clouddisk.config.Reflective;
 import io.swagger.v3.oas.annotations.media.Schema;
 import lombok.Builder;
 import lombok.Data;
@@ -16,7 +17,7 @@ import lombok.EqualsAndHashCode;
 @Data
 @Builder
 @Schema
-public class SearchDTO extends QueryBaseDTO {
+public class SearchDTO extends QueryBaseDTO implements Reflective {
 
     String id;
 
@@ -149,26 +150,26 @@ public class SearchDTO extends QueryBaseDTO {
     }
 
     public SearchOptionHistoryDO toSearchOptionDO() {
-        SearchOptionHistoryDO.SearchOptionHistoryDOBuilder builder = SearchOptionHistoryDO.builder();
-        builder.id(id)
-                .userId(userId)
-                .keyword(keyword)
-                .type(type)
-                .currentDirectory(currentDirectory)
-                .isFolder(isFolder)
-                .isFavorite(isFavorite)
-                .tagId(tagId)
-                .folder(folder)
-                .modifyStart(modifyStart)
-                .modifyEnd(modifyEnd)
-                .sizeMin(sizeMin)
-                .sizeMax(sizeMax)
-                .searchMount(searchMount)
-                .searchOverall(searchOverall)
-                .exactSearch(exactSearch)
-                .includeTagName(includeTagName)
-                .includeFileName(includeFileName)
-                .includeFileContent(includeFileContent);
-        return builder.build();
+        SearchOptionHistoryDO searchOptionHistoryDO = new SearchOptionHistoryDO();
+        searchOptionHistoryDO.setId(id);
+        searchOptionHistoryDO.setUserId(userId);
+        searchOptionHistoryDO.setKeyword(keyword);
+        searchOptionHistoryDO.setType(type);
+        searchOptionHistoryDO.setCurrentDirectory(currentDirectory);
+        searchOptionHistoryDO.setIsFolder(isFolder);
+        searchOptionHistoryDO.setIsFavorite(isFavorite);
+        searchOptionHistoryDO.setTagId(tagId);
+        searchOptionHistoryDO.setFolder(folder);
+        searchOptionHistoryDO.setModifyStart(modifyStart);
+        searchOptionHistoryDO.setModifyEnd(modifyEnd);
+        searchOptionHistoryDO.setSizeMin(sizeMin);
+        searchOptionHistoryDO.setSizeMax(sizeMax);
+        searchOptionHistoryDO.setSearchMount(searchMount);
+        searchOptionHistoryDO.setSearchOverall(searchOverall);
+        searchOptionHistoryDO.setExactSearch(exactSearch);
+        searchOptionHistoryDO.setIncludeTagName(includeTagName);
+        searchOptionHistoryDO.setIncludeFileName(includeFileName);
+        searchOptionHistoryDO.setIncludeFileContent(includeFileContent);
+        return searchOptionHistoryDO;
     }
 }

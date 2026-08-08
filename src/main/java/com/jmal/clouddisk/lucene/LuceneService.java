@@ -1,45 +1,61 @@
 package com.jmal.clouddisk.lucene;
 
-import cn.hutool.core.io.CharsetDetector;
 import cn.hutool.core.io.FileTypeUtil;
 import cn.hutool.core.io.FileUtil;
 import cn.hutool.core.text.CharSequenceUtil;
 import cn.hutool.core.thread.ThreadUtil;
 import com.jmal.clouddisk.config.FileProperties;
+import com.jmal.clouddisk.dao.IFileDAO;
 import com.jmal.clouddisk.model.FileIndex;
-import com.jmal.clouddisk.model.FileIntroVO;
-import com.jmal.clouddisk.model.Tag;
+import com.jmal.clouddisk.model.file.dto.FileBaseLuceneDTO;
 import com.jmal.clouddisk.service.Constants;
 import com.jmal.clouddisk.service.IUserService;
 import com.jmal.clouddisk.service.impl.CommonFileService;
+import com.jmal.clouddisk.service.impl.CommonUserService;
 import com.jmal.clouddisk.util.FileContentTypeUtils;
 import com.jmal.clouddisk.util.MyFileUtils;
-import com.mongodb.client.AggregateIterable;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.lucene.document.*;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.IntPoint;
+import org.apache.lucene.document.NumericDocValuesField;
+import org.apache.lucene.document.SortedDocValuesField;
+import org.apache.lucene.document.StringField;
+import org.apache.lucene.document.TextField;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.Term;
-import org.mozilla.universalchardet.UniversalDetector;
-import org.springframework.data.mongodb.core.MongoTemplate;
-import org.springframework.data.mongodb.core.query.Criteria;
-import org.springframework.data.mongodb.core.query.Update;
+import org.apache.lucene.util.BytesRef;
+import org.springframework.context.ApplicationListener;
 import org.springframework.stereotype.Service;
 
-import java.io.*;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.Reader;
+import java.io.StringWriter;
+import java.io.Writer;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.nio.charset.UnsupportedCharsetException;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.*;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-
-import static com.jmal.clouddisk.service.impl.CommonFileService.COLLECTION_NAME;
 
 /**
  * @author jmal
@@ -53,15 +69,16 @@ import static com.jmal.clouddisk.service.impl.CommonFileService.COLLECTION_NAME;
 @Service
 @Slf4j
 @RequiredArgsConstructor
-public class LuceneService {
+public class LuceneService implements ApplicationListener<LuceneIndexQueueEvent> {
 
     private final FileProperties fileProperties;
-    private final MongoTemplate mongoTemplate;
+    private final IFileDAO fileDAO;
     private final IndexWriter indexWriter;
-    private final IUserService userService;
+    private final CommonUserService userService;
     private final ReadContentService readContentService;
+    private final PopplerPdfReader popplerPdfReader;
     private final RebuildIndexTaskService rebuildIndexTaskService;
-    private final SearchFileService searchFileService;
+    private final LuceneQueryService luceneQueryService;
     private final EtagService esTagService;
 
     public static final String MONGO_INDEX_FIELD = "index";
@@ -108,26 +125,28 @@ public class LuceneService {
     public static final String FIELD_CONTENT_FUZZY = "content";
     public static final String FIELD_FILENAME_FUZZY = "filename";
     public static final String FIELD_TAG_NAME_FUZZY = "tagName";
+    public static final String FIELD_TAG_ID = "tagId";
 
     // 定义分段大小
     private static final int CHUNK_SIZE_CHARS = 1024; // 例如，每 1KB 左右一个块，或者按行数
     private static final int CHUNK_OVERLAP_CHARS = 7; // 段落间的重叠字符数，防止边界切割问题 (NGramTokenFilter本身可能处理部分边界，但显式重叠更保险)
 
     public static final int BYTES_PER_MB = 1024 * 1024;
+    private static final int BIG_FILE_BYTES_MB = 10 * BYTES_PER_MB; // 10MB
     private static final long MEMORY_PER_SMALL_THREAD_MB = 500;
     private static final long MEMORY_PER_BIG_THREAD_MB = 4096;
 
     @PostConstruct
     public void init() {
         if (executorCreateIndexService == null) {
-            int processors = Runtime.getRuntime().availableProcessors() - 2;
-            executorCreateIndexService = ThreadUtil.newFixedExecutor(Math.max(processors, 3), 100, "createIndexFileTask", true);
+            int processors = Runtime.getRuntime().availableProcessors() / 2;
+            executorCreateIndexService = ThreadUtil.newFixedExecutor(Math.max(processors, 2), 100, "createIndexFileTask", true);
         }
         // 获取jvm可用内存
         long maxMemory = Runtime.getRuntime().maxMemory();
         if (executorUpdateContentIndexService == null) {
             // 获取可用处理器数量
-            int smallProcessors = Runtime.getRuntime().availableProcessors() - 3;
+            int smallProcessors = Runtime.getRuntime().availableProcessors() / 2;
             // 设置线程数, 假设每个线程占用内存为500M
             int maxSmallProcessors = Math.toIntExact((maxMemory / BYTES_PER_MB) / MEMORY_PER_SMALL_THREAD_MB);
             if (smallProcessors > maxSmallProcessors) {
@@ -142,7 +161,17 @@ public class LuceneService {
             bigProcessors = Math.max(bigProcessors, 1);
             executorUpdateBigContentIndexService = ThreadUtil.newFixedExecutor(bigProcessors, 100, "updateBigContentIndexTask", true);
         }
-        log.info("NGRAM_MAX_CONTENT_LENGTH_MB:{}, NGRAM_MIN_SIZE: {}, ngramMaxSize: {}", fileProperties.getNgramMaxContentLengthMB(), fileProperties.getNgramMinSize(), fileProperties.getNgramMaxSize());
+        log.debug("NGRAM_MAX_CONTENT_LENGTH_MB:{}, NGRAM_MIN_SIZE: {}, ngramMaxSize: {}", fileProperties.getNgramMaxContentLengthMB(), fileProperties.getNgramMinSize(), fileProperties.getNgramMaxSize());
+    }
+
+    @Override
+    public void onApplicationEvent(LuceneIndexQueueEvent event) {
+        if (event.getFileId() != null) {
+            pushCreateIndexQueue(event.getFileId());
+        }
+        if (event.getDelFileIds() != null) {
+            deleteIndexDocuments(event.getDelFileIds());
+        }
     }
 
     /**
@@ -233,48 +262,61 @@ public class LuceneService {
      */
     private void createIndexFiles(List<String> fileIdList) {
         // 提取出fileIdList
-        List<FileIntroVO> fileIntroVOList = searchFileService.getFileIntroVOs(fileIdList);
-        for (FileIntroVO fileIntroVO : fileIntroVOList) {
+        List<FileBaseLuceneDTO> fileBaseLuceneDTOList = fileDAO.findFileBaseLuceneDTOByIdIn(fileIdList);
+        for (FileBaseLuceneDTO fileBaseLuceneDTO : fileBaseLuceneDTOList) {
             rebuildIndexTaskService.incrementNotIndexTaskSize();
-            updateIndex(false, fileIntroVO);
+            updateIndex(false, fileBaseLuceneDTO);
         }
         rebuildIndexTaskService.removeDeletedFlag(fileIdList);
     }
 
-    private void updateIndex(boolean readContent, FileIntroVO fileIntroVO) {
+    private void updateIndex(boolean readContent, FileBaseLuceneDTO fileBaseLuceneDTO) {
         try {
-            File file = getFileByFileIntroVO(fileIntroVO);
+            File file = getFileByFileBaseLuceneDTO(fileBaseLuceneDTO);
             boolean isContent = checkFileContent(file);
             if (!readContent && isContent) {
-                pushCreateIndexContentQueue(fileIntroVO.getId());
+                pushCreateIndexContentQueue(fileBaseLuceneDTO.getId());
             }
             if (!readContent && !isContent) {
                 rebuildIndexTaskService.incrementIndexedTaskSize();
             }
-            FileIndex fileIndex = new FileIndex(file, fileIntroVO);
-            fileIndex.setTagName(getTagName(fileIntroVO));
+            FileIndex fileIndex = new FileIndex(file, fileBaseLuceneDTO);
             setFileIndex(fileIndex);
+
+            // 检查是否已存在相同的索引
+            String hash = readContent ? "1" : null;
+            String fileIndexHash = fileIndex.getFileIndexHash(hash);
+            String etagType = (hash == null) ? Constants.NO_CONTENT_ETAG : Constants.ETAG;
+            if (luceneQueryService.existsSha256(etagType, fileIndexHash)) {
+                return;
+            }
+
             if (readContent) {
                 try (StringWriter contentWriter = new StringWriter()) {
-                    readFileContent(file, fileIntroVO.getId(), contentWriter);
+                    readFileContent(file, fileBaseLuceneDTO.getId(), contentWriter);
                     String fullContent = contentWriter.toString();
 
                     if (CharSequenceUtil.isBlank(fullContent)) {
-                        updateIndexStatus(fileIntroVO, IndexStatus.INDEXED);
                         return;
                     }
-                    // 调用改造后的 updateIndexDocument
-                    updateIndexDocument(indexWriter, fileIndex, fullContent);
+                    // 建立包含内容的索引
+                    updateIndexDocument(indexWriter, fileIndex, fullContent, fileIndexHash);
                     startProcessFilesToBeIndexed();
+                } catch (IOException e) {
+                    log.warn("读取文件内容失败: file={}, {}", file.getAbsolutePath(), e.getMessage(), e);
                 }
             } else {
-                updateIndexDocument(indexWriter, fileIndex, null);
+                // 不读取内容只建立基础索引
+                updateIndexDocument(indexWriter, fileIndex, null, fileIndexHash);
+                // 更新文件etag
+                String username = userService.getUserNameById(fileBaseLuceneDTO.getUserId());
+                esTagService.updateFileEtagAsync(username, getFileByFileBaseLuceneDTO(fileBaseLuceneDTO));
             }
             log.debug("添加索引, filepath: {}", file.getAbsoluteFile());
         } catch (Exception e) {
             log.warn("updateIndexError: {}", e.getMessage(), e);
         } finally {
-            updateIndexStatus(fileIntroVO, IndexStatus.INDEXED);
+            updateIndexStatus(fileBaseLuceneDTO, IndexStatus.INDEXED);
             if (readContent) {
                 rebuildIndexTaskService.incrementIndexedTaskSize();
             }
@@ -284,31 +326,16 @@ public class LuceneService {
     /**
      * 更新索引状态
      *
-     * @param fileIntroVO fileIntroVO
+     * @param fileBaseLuceneDTO FileBaseLuceneDTO
      * @param indexStatus IndexStatus
      */
-    private void updateIndexStatus(FileIntroVO fileIntroVO, IndexStatus indexStatus) {
-        org.springframework.data.mongodb.core.query.Query query = new org.springframework.data.mongodb.core.query.Query();
-        query.addCriteria(Criteria.where("_id").is(fileIntroVO.getId()));
-        Update update = new Update();
-        update.set(MONGO_INDEX_FIELD, indexStatus.getStatus());
-        mongoTemplate.updateFirst(query, update, COLLECTION_NAME);
-
-        // set etag
-        String username = userService.getUserNameById(fileIntroVO.getUserId());
-        esTagService.updateFileEtagAsync(username, getFileByFileIntroVO(fileIntroVO));
+    private void updateIndexStatus(FileBaseLuceneDTO fileBaseLuceneDTO, IndexStatus indexStatus) {
+        fileDAO.updateLuceneIndexStatusByIdIn(Collections.singletonList(fileBaseLuceneDTO.getId()), indexStatus.getStatus());
     }
 
-    private File getFileByFileIntroVO(FileIntroVO fileIntroVO) {
-        String username = userService.getUserNameById(fileIntroVO.getUserId());
-        return Paths.get(fileProperties.getRootDir(), username, fileIntroVO.getPath(), fileIntroVO.getName()).toFile();
-    }
-
-    private String getTagName(FileIntroVO fileIntroVO) {
-        if (fileIntroVO != null && fileIntroVO.getTags() != null && !fileIntroVO.getTags().isEmpty()) {
-            return fileIntroVO.getTags().stream().map(Tag::getName).reduce((a, b) -> a + " " + b).orElse("");
-        }
-        return null;
+    private File getFileByFileBaseLuceneDTO(FileBaseLuceneDTO fileBaseLuceneDTO) {
+        String username = userService.getUserNameById(fileBaseLuceneDTO.getUserId());
+        return Paths.get(fileProperties.getRootDir(), username, fileBaseLuceneDTO.getPath(), fileBaseLuceneDTO.getName()).toFile();
     }
 
     /**
@@ -360,26 +387,26 @@ public class LuceneService {
     }
 
     private void readFileContent(File file, String fileId, Writer writer) {
+        Charset charset = null;
         try {
             if (file == null || !file.isFile() || file.length() < 1) {
                 return;
             }
             String type = FileTypeUtil.getType(file).toLowerCase();
             switch (type) {
-                case "pdf" -> readContentService.readPdfContent(file, fileId, writer);
-                case "dwg" -> readContentService.dwg2mxweb(file, fileId);
+                case "pdf" -> popplerPdfReader.readPdfContent(file, fileId, writer);
                 case "epub" -> readContentService.readEpubContent(file, fileId, writer);
                 case "ppt", "pptx" -> readContentService.readPPTContent(file, writer);
                 case "doc", "docx" -> readContentService.readWordContent(file, writer);
                 case "xls", "xlsx" -> readContentService.readExcelContent(file, writer);
                 default -> {
                     if (fileProperties.getSimText().contains(type)) {
-                        String charset = UniversalDetector.detectCharset(file);
-                        if (CharSequenceUtil.isBlank(charset)) {
-                            charset = String.valueOf(CharsetDetector.detect(file, StandardCharsets.UTF_8));
+                        charset = MyFileUtils.getCharset(file);
+                        if (charset == null) {
+                            return;
                         }
                         // 对于纯文本，可以流式读取
-                        try (Reader reader = new InputStreamReader(new FileInputStream(file), Charset.forName(charset))) {
+                        try (Reader reader = new InputStreamReader(new FileInputStream(file), charset)) {
                             reader.transferTo(writer);
                         }
                     } else {
@@ -392,6 +419,8 @@ public class LuceneService {
                     }
                 }
             }
+        } catch (UnsupportedCharsetException unsupportedCharsetException) {
+            log.warn("不支持的字符集, charset: {}, file: {}, {}", charset, file.getAbsolutePath(), unsupportedCharsetException.getMessage());
         } catch (Exception e) {
             log.error("读取文件内容失败, file: {}, {}", file.getAbsolutePath(), e.getMessage(), e);
         }
@@ -418,14 +447,20 @@ public class LuceneService {
         }
     }
 
+    private final Object commitLock = new Object();
 
-    public void deleteIndexDocuments(List<String> fileIds) {
+    public void deleteIndexDocuments(Collection<String> fileIds) {
+        if (fileIds == null || fileIds.isEmpty()) {
+            return;
+        }
         try {
-            for (String fileId : fileIds) {
-                Term term = new Term("id", fileId);
-                indexWriter.deleteDocuments(term);
+            Term[] termsToDelete = fileIds.stream()
+                    .map(fileId -> new Term("id", fileId))
+                    .toArray(Term[]::new);
+            indexWriter.deleteDocuments(termsToDelete);
+            synchronized (commitLock) {
+                indexWriter.commit();
             }
-            indexWriter.commit();
         } catch (IOException e) {
             log.error("删除索引失败, fileIds: {}, {}", fileIds, e.getMessage(), e);
         }
@@ -434,11 +469,12 @@ public class LuceneService {
     /**
      * 添加/更新索引
      *
-     * @param indexWriter indexWriter
-     * @param fileIndex   FileIndex
-     * @param fullContent fullContent
+     * @param indexWriter   indexWriter
+     * @param fileIndex     FileIndex
+     * @param fullContent   fullContent
+     * @param fileIndexHash 文件索引哈希值
      */
-    public void updateIndexDocument(IndexWriter indexWriter, FileIndex fileIndex, String fullContent) {
+    public void updateIndexDocument(IndexWriter indexWriter, FileIndex fileIndex, String fullContent, String fileIndexHash) {
         String fileId = fileIndex.getFileId();
         try {
             String fileName = (fileIndex.getName() == null ? "" : fileIndex.getName()) + " " + fileIndex.getRemark();
@@ -446,18 +482,25 @@ public class LuceneService {
             Boolean isFolder = fileIndex.getIsFolder();
             Boolean isFavorite = fileIndex.getIsFavorite();
             String path = fileIndex.getPath();
-            org.apache.lucene.document.Document newDocument = new org.apache.lucene.document.Document();
+            Document newDocument = new Document();
             newDocument.add(new StringField("id", fileId, Field.Store.YES));
             newDocument.add(new StringField(IUserService.USER_ID, fileIndex.getUserId(), Field.Store.NO));
+
+            newDocument.add(new StringField(Constants.NO_CONTENT_ETAG, fileIndex.getFileIndexHash(null), Field.Store.NO));
+            newDocument.add(new StringField(Constants.ETAG, fileIndexHash, Field.Store.NO));
+
             if (fileIndex.getType() != null) {
                 newDocument.add(new StringField("type", fileIndex.getType(), Field.Store.NO));
             }
             if (CharSequenceUtil.isNotBlank(fileName)) {
                 newDocument.add(new Field(FIELD_FILENAME_NGRAM, fileName, TextField.TYPE_NOT_STORED));
                 newDocument.add(new TextField(FIELD_FILENAME_FUZZY, fileName, Field.Store.NO));
+                int extractIndex = Math.min(fileName.length() - 1, 2);
+                newDocument.add(new SortedDocValuesField("name_sort", new BytesRef(fileName.substring(0, extractIndex).toLowerCase().getBytes(StandardCharsets.UTF_8))));
             }
             if (isFolder != null) {
                 newDocument.add(new IntPoint(Constants.IS_FOLDER, isFolder ? 1 : 0));
+                newDocument.add(new NumericDocValuesField("is_folder_sort", isFolder ? 1 : 0));
             }
             if (isFavorite != null) {
                 newDocument.add(new IntPoint(Constants.IS_FAVORITE, isFavorite ? 1 : 0));
@@ -469,23 +512,16 @@ public class LuceneService {
                 newDocument.add(new Field(FIELD_TAG_NAME_NGRAM, tagName, TextField.TYPE_NOT_STORED));
                 newDocument.add(new TextField(FIELD_TAG_NAME_FUZZY, tagName, Field.Store.NO));
             }
+            if (fileIndex.getTagIds() != null && !fileIndex.getTagIds().isEmpty()) {
+                for (String tagId : fileIndex.getTagIds()) {
+                    if (CharSequenceUtil.isNotBlank(tagId)) {
+                        newDocument.add(new StringField(FIELD_TAG_ID, tagId, Field.Store.NO));
+                    }
+                }
+            }
             if (CharSequenceUtil.isNotBlank(fullContent)) {
                 newDocument.add(new TextField(FIELD_CONTENT_FUZZY, fullContent, Field.Store.NO));
             }
-
-            // 为精确子串匹配处理 content_ngram
-            // if (CharSequenceUtil.isNotBlank(fullContent) && fileProperties.getExactSearch()) {
-            //     // 对非常大的文件，跳过N-Gram或只处理一部分
-            //     String contentForNgram = getContentForNgram(content, fileIndex);
-            //     if (CharSequenceUtil.isNotBlank(contentForNgram)) {
-            //         List<String> chunks = segmentContent(contentForNgram);
-            //         for (String chunk : chunks) {
-            //             if (CharSequenceUtil.isNotBlank(chunk)) {
-            //                 newDocument.add(new Field(FIELD_CONTENT_NGRAM, chunk, TextField.TYPE_NOT_STORED));
-            //             }
-            //         }
-            //     }
-            // }
             if (CharSequenceUtil.isNotBlank(fullContent) && fileProperties.getExactSearch()) {
                 String contentForNgram;
                 // 将完整内容字符串转换为内存中的输入流
@@ -510,8 +546,11 @@ public class LuceneService {
             if (fileIndex.getModified() != null) {
                 newDocument.add(new NumericDocValuesField("modified", fileIndex.getModified()));
             }
+            if (fileIndex.getCreated() != null) {
+                newDocument.add(new NumericDocValuesField("created", fileIndex.getCreated()));
+            }
             if (fileIndex.getSize() != null) {
-                newDocument.add(new NumericDocValuesField("size", fileIndex.getSize()));
+                newDocument.add(new NumericDocValuesField(Constants.SIZE, fileIndex.getSize()));
             }
             indexWriter.updateDocument(new Term("id", fileId), newDocument);
         } catch (IOException e) {
@@ -584,13 +623,6 @@ public class LuceneService {
         return chunks;
     }
 
-    public FileIntroVO getFileIntroVO(String fileId) {
-        org.springframework.data.mongodb.core.query.Query query = new org.springframework.data.mongodb.core.query.Query();
-        query.addCriteria(Criteria.where("_id").is(fileId));
-        query.fields().include("id", "name", "userId", "path", "isFolder", "isFavorite", "remark", "tags", "etag", "size");
-        return mongoTemplate.findOne(query, FileIntroVO.class, COLLECTION_NAME);
-    }
-
     /**
      * 添加待索引标记
      */
@@ -598,11 +630,7 @@ public class LuceneService {
         if (fielIdList.isEmpty()) {
             return;
         }
-        org.springframework.data.mongodb.core.query.Query query = new org.springframework.data.mongodb.core.query.Query();
-        query.addCriteria(Criteria.where("_id").in(fielIdList));
-        Update update = new Update();
-        update.set(MONGO_INDEX_FIELD, IndexStatus.NOT_INDEX.getStatus());
-        mongoTemplate.updateMulti(query, update, COLLECTION_NAME);
+        fileDAO.updateLuceneIndexStatusByIdIn(fielIdList, IndexStatus.NOT_INDEX.getStatus());
         // 添加待索引标记
         startProcessFilesToBeIndexed();
     }
@@ -616,19 +644,15 @@ public class LuceneService {
         while (run) {
             if (!hasUnIndexFile()) {
                 log.debug("待索引文件处理完成");
-                rebuildIndexTaskService.rebuildingIndexCompleted();
+                rebuildIndexTaskService.delayResetIndex();
+                indexWriter.commit();
                 run = false;
             }
-            List<org.bson.Document> pipeline = Arrays.asList(new org.bson.Document("$match", new org.bson.Document(MONGO_INDEX_FIELD, IndexStatus.NOT_INDEX.getStatus())), new org.bson.Document("$project", new org.bson.Document("_id", 1)), new org.bson.Document("$limit", 8));
-            AggregateIterable<org.bson.Document> aggregateIterable = mongoTemplate.getCollection(COLLECTION_NAME).aggregate(pipeline);
-            for (org.bson.Document document : aggregateIterable) {
-                String fileId = document.getObjectId("_id").toHexString();
-                FileIntroVO fileIntroVO = getFileIntroVO(fileId);
-                if (fileIntroVO != null) {
-                    // 处理待索引文件
-                    updateIndexStatus(fileIntroVO, IndexStatus.INDEXING);
-                    processFileThreaded(fileIntroVO);
-                }
+            List<FileBaseLuceneDTO> fileBaseLuceneDTOList = fileDAO.findFileBaseLuceneDTOByLuceneIndex(IndexStatus.NOT_INDEX.getStatus(), 8);
+            for (FileBaseLuceneDTO fileBaseLuceneDTO : fileBaseLuceneDTOList) {
+                // 处理待索引文件
+                updateIndexStatus(fileBaseLuceneDTO, IndexStatus.INDEXING);
+                processFileThreaded(fileBaseLuceneDTO);
             }
         }
     }
@@ -637,26 +661,24 @@ public class LuceneService {
      * 是否存在待索引文件
      */
     private boolean hasUnIndexFile() {
-        org.springframework.data.mongodb.core.query.Query query = new org.springframework.data.mongodb.core.query.Query();
-        query.addCriteria(Criteria.where(MONGO_INDEX_FIELD).is(IndexStatus.NOT_INDEX.getStatus()));
-        long count = mongoTemplate.count(query, COLLECTION_NAME);
+        long count = fileDAO.countByLuceneIndex(IndexStatus.NOT_INDEX.getStatus());
         return count > 0;
     }
 
-    private void processFileThreaded(FileIntroVO fileIntroVO) {
-        long size = fileIntroVO.getSize();
+    private void processFileThreaded(FileBaseLuceneDTO fileBaseLuceneDTO) {
+        long size = fileBaseLuceneDTO.getSize();
 
         if (RebuildIndexTaskService.isSyncFile()) {
             // 单线程处理
-            updateIndex(true, fileIntroVO);
+            updateIndex(true, fileBaseLuceneDTO);
         } else {
             // 根据文件大小选择多线程处理
-            if (size > 10 * 1024 * 1024) {
+            if (size > BIG_FILE_BYTES_MB) {
                 // 大文件，使用特定线程池处理
-                executorUpdateBigContentIndexService.execute(() -> updateIndex(true, fileIntroVO));
+                executorUpdateBigContentIndexService.execute(() -> updateIndex(true, fileBaseLuceneDTO));
             } else {
                 // 小文件，使用普通线程池处理
-                executorUpdateContentIndexService.execute(() -> updateIndex(true, fileIntroVO));
+                executorUpdateContentIndexService.execute(() -> updateIndex(true, fileBaseLuceneDTO));
             }
         }
     }
@@ -677,17 +699,43 @@ public class LuceneService {
 
     @PreDestroy
     public void destroy() {
-        if (executorCreateIndexService != null) {
-            executorCreateIndexService.shutdown();
+        log.debug("开始关闭 LuceneService 线程池...");
+        shutdownExecutor(executorCreateIndexService, "createIndexFileTask");
+        shutdownExecutor(executorUpdateContentIndexService, "updateContentIndexTask");
+        shutdownExecutor(executorUpdateBigContentIndexService, "updateBigContentIndexTask");
+        shutdownExecutor(scheduler, "luceneScheduler");
+
+        // 最后提交所有待处理的索引
+        try {
+            synchronized (commitLock) {
+                indexWriter.commit();
+                log.debug("最终索引提交完成");
+            }
+        } catch (IOException e) {
+            log.error("最终索引提交失败", e);
         }
-        if (executorUpdateContentIndexService != null) {
-            executorUpdateContentIndexService.shutdown();
+    }
+
+    private void shutdownExecutor(ExecutorService executor, String name) {
+        if (executor == null) {
+            return;
         }
-        if (executorUpdateBigContentIndexService != null) {
-            executorUpdateBigContentIndexService.shutdown();
-        }
-        if (scheduler != null) {
-            scheduler.shutdown();
+
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+                log.warn("{} 线程池未能在60秒内完成，强制关闭", name);
+                List<Runnable> droppedTasks = executor.shutdownNow();
+                log.warn("{} 线程池丢弃了 {} 个任务", name, droppedTasks.size());
+
+                if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
+                    log.error("{} 线程池无法完全关闭", name);
+                }
+            }
+        } catch (InterruptedException e) {
+            log.error("{} 线程池关闭被中断", name, e);
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
         }
     }
 

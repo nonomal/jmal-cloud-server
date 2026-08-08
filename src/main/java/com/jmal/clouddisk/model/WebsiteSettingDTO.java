@@ -1,6 +1,8 @@
 package com.jmal.clouddisk.model;
 
 import cn.hutool.core.util.StrUtil;
+import com.jmal.clouddisk.config.Reflective;
+import io.swagger.v3.oas.annotations.media.Schema;
 import lombok.Data;
 
 import java.util.List;
@@ -11,7 +13,7 @@ import java.util.List;
  * @Date 2020/11/5 3:58 下午
  */
 @Data
-public class WebsiteSettingDTO {
+public class WebsiteSettingDTO implements Reflective {
     String userId;
     /***
      * 用户头像
@@ -37,6 +39,11 @@ public class WebsiteSettingDTO {
      * 网盘名称
      */
     String netdiskName;
+    /**
+     * 动态地址配置
+     */
+    private DynamicAddressConfig dynamicAddress;
+    private NetdiskPersonalization personalization;
     /***
      * 站点地址
      */
@@ -109,6 +116,9 @@ public class WebsiteSettingDTO {
 
     Boolean exactSearch;
 
+    @Schema(name = "forceEnable", title = "是否强制启用多因素认证")
+    Boolean mfaForceEnable;
+
     @Data
     public static class OperatingButton {
         /***
@@ -125,6 +135,13 @@ public class WebsiteSettingDTO {
         String url;
     }
 
+    public String getSiteUrl() {
+        if (StrUtil.isBlank(siteUrl)) {
+            return "/articles";
+        }
+        return siteUrl;
+    }
+
     public boolean isShowAlonePage(String page){
         return alonePages.contains(page);
     }
@@ -133,4 +150,10 @@ public class WebsiteSettingDTO {
         return !StrUtil.isBlank(networkRecordNumberStr);
     }
 
+    public String getNetdiskName() {
+        if (personalization != null && !StrUtil.isBlank(personalization.getName())) {
+            return personalization.getName();
+        }
+        return netdiskName;
+    }
 }

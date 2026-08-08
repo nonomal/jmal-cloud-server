@@ -1,11 +1,16 @@
 package com.jmal.clouddisk.service;
 
+import com.jmal.clouddisk.controller.rest.FileController;
 import com.jmal.clouddisk.exception.CommonException;
-import com.jmal.clouddisk.model.*;
-import com.jmal.clouddisk.model.rbac.ConsumerDO;
+import com.jmal.clouddisk.model.EditTagDTO;
+import com.jmal.clouddisk.model.ShareDO;
+import com.jmal.clouddisk.model.UploadApiParamDTO;
+import com.jmal.clouddisk.model.file.FileDocument;
+import com.jmal.clouddisk.model.file.FileIntroVO;
 import com.jmal.clouddisk.util.ResponseResult;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.core.io.InputStreamResource;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
@@ -122,13 +127,6 @@ public interface IFileService {
     ResponseResult<Object> listFiles(UploadApiParamDTO upload);
 
     /**
-     * 用户占用空间
-     * @param userId 用户id
-     * @return long
-     */
-    long takeUpSpace(String userId);
-
-    /**
      * 搜索文件
      * @param upload 上传参数
      * @param keyword 关键字
@@ -180,13 +178,6 @@ public interface IFileService {
     Optional<FileDocument> thumbnail(String id, Boolean showCover);
 
     /**
-     * 获取dwg文件对应的mxweb文件
-     * @param id fileId
-     * @return FileDocument
-     */
-    Optional<FileDocument> getMxweb(String id);
-
-    /**
      * 显示缩略图(媒体文件封面)
      * @param id fileId
      * @param username username
@@ -194,7 +185,7 @@ public interface IFileService {
      */
     Optional<FileDocument> coverOfMedia(String id, String username);
 
-    ResponseEntity<Object> getObjectResponseEntity(FileDocument fileDocument);
+    ResponseEntity<InputStreamResource> getImageInputStreamResourceEntity(FileDocument fileDocument);
 
     /**
      * 分享里的打包下载
@@ -248,22 +239,6 @@ public interface IFileService {
      * @return ResponseResult<Object>
      */
     ResponseResult<Object> copy(UploadApiParamDTO upload, List<String> froms, String to) throws IOException;
-
-    /**
-     * 上传用户图片
-     * @param upload 上传参数
-     * @return String
-     */
-    String uploadConsumerImage(UploadApiParamDTO upload);
-
-    /**
-     * 根据文件Id获取文件信息
-     * @param fileId 文件Id
-     * @return FileDocument
-     */
-    FileDocument getById(String fileId);
-
-    FileDocument getById(String fileId, boolean excludeContent);
 
     /**
      * 创建文件/文件夹(mongodb)
@@ -359,12 +334,6 @@ public interface IFileService {
     String publicViewFile(String relativePath, String userId);
 
     /***
-     * 删除用户的所有文件
-     * @param userList 用户列表
-     */
-    void deleteAllByUser(List<ConsumerDO> userList);
-
-    /***
      * 设置文件为分享文件
      * @param file FileDocument
      * @param expiresAt 过期时间
@@ -378,18 +347,12 @@ public interface IFileService {
      */
     void unsetShareFile(FileDocument file);
 
-    /***
-     * 设为公共文件
-     * @param fileId 文件Id
-     */
-    void setPublic(String fileId);
-
     /**
      * 根据文件Id列表获取文件列表
      * @param fileIdList 文件Id列表
      * @return 文件列表
      */
-    List<FileDocument> listByIds(List<String> fileIdList);
+    List<String> findByIdIn(List<String> fileIdList);
 
     /**
      * 创建副本
@@ -450,5 +413,12 @@ public interface IFileService {
      * @param fileIds 文件id列表
      * @return ResponseResult<Object>
      */
-    ResponseResult<Object> isAllowDownload(List<String> fileIds);
+    ResponseResult<FileController.DownloadBeforeResult> isAllowDownload(List<String> fileIds);
+
+    /**
+     * 是否允许批量下载
+     * @param fileIds 文件id列表
+     * @return ResponseResult<Object>
+     */
+    ResponseResult<FileController.DownloadBeforeResult> isAllowPackageDownload(List<String> fileIds);
 }

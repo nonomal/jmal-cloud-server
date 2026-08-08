@@ -1,8 +1,15 @@
 package com.jmal.clouddisk.model;
 
-import cn.hutool.core.util.URLUtil;
 import com.fasterxml.jackson.annotation.JsonFormat;
+import com.jmal.clouddisk.config.Reflective;
+import com.jmal.clouddisk.dao.util.PageableUtil;
+import com.jmal.clouddisk.model.query.QueryBaseDTO;
+import com.jmal.clouddisk.model.query.SearchDTO;
+import com.jmal.clouddisk.service.Constants;
+import com.jmal.clouddisk.util.FileNameUtils;
 import lombok.Data;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -19,7 +26,7 @@ import java.util.Map;
  * @author jmal
  */
 @Data
-public class UploadApiParamDTO {
+public class UploadApiParamDTO implements Reflective {
     /***
      * 当前是第几个分片
      */
@@ -269,7 +276,7 @@ public class UploadApiParamDTO {
     private LocalDateTime uploadDate;
 
     public String getFilename() {
-        return URLUtil.decode(filename);
+        return FileNameUtils.decodeAndCheckPath(filename);
     }
 
     public String getRelativePath() {
@@ -277,7 +284,7 @@ public class UploadApiParamDTO {
             // Windows 系统
             relativePath = relativePath.replace("/", "\\");
         }
-        return URLUtil.decode(relativePath);
+        return FileNameUtils.decodeAndCheckPath(relativePath);
     }
 
     public String getCurrentDirectory() {
@@ -288,7 +295,7 @@ public class UploadApiParamDTO {
             // Windows 系统
             currentDirectory = currentDirectory.replace("/", "\\");
         }
-        return URLUtil.decode(currentDirectory);
+        return FileNameUtils.decodeAndCheckPath(currentDirectory);
     }
 
     public String getFolderPath() {
@@ -299,7 +306,30 @@ public class UploadApiParamDTO {
             // Windows 系统
             folderPath = folderPath.replace("/", "\\");
         }
-        return URLUtil.decode(folderPath);
+        return FileNameUtils.decodeAndCheckPath(folderPath);
     }
 
+    public SearchDTO toSearchDTO() {
+        SearchDTO searchDTO = SearchDTO.builder().build();
+        searchDTO.setPage(getPageIndex());
+        searchDTO.setPageSize(getPageSize());
+        if (getOrder() != null && getSortableProp() != null) {
+            searchDTO.setSortProp(getSortableProp());
+            searchDTO.setSortOrder(getOrder());
+        } else {
+            searchDTO.setSortProp(Constants.FILENAME_FIELD);
+            searchDTO.setSortOrder(Constants.ASCENDING);
+        }
+        return searchDTO;
+    }
+
+    public Pageable getPageable() {
+        return PageableUtil.buildPageable(toSearchDTO());
+    }
+
+    public Pageable getPageable(Sort firstSort) {
+        QueryBaseDTO queryBaseDTO = toSearchDTO();
+        queryBaseDTO.setFirstSort(firstSort);
+        return PageableUtil.buildPageable(queryBaseDTO);
+    }
 }

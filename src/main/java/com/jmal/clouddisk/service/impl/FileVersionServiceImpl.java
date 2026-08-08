@@ -1,69 +1,71 @@
 package com.jmal.clouddisk.service.impl;
 
+import cn.hutool.core.convert.Convert;
 import cn.hutool.core.date.DatePattern;
-import cn.hutool.core.date.DateUtil;
 import cn.hutool.core.date.LocalDateTimeUtil;
 import cn.hutool.core.io.FileUtil;
 import cn.hutool.core.text.CharSequenceUtil;
-import cn.hutool.core.util.URLUtil;
+import cn.hutool.core.util.CharsetUtil;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.jmal.clouddisk.config.FileProperties;
+import com.jmal.clouddisk.dao.IFileDAO;
+import com.jmal.clouddisk.dao.IFileHistoryDAO;
 import com.jmal.clouddisk.exception.CommonException;
 import com.jmal.clouddisk.exception.ExceptionType;
-import com.jmal.clouddisk.lucene.LuceneService;
-import com.jmal.clouddisk.model.FileDocument;
+import com.jmal.clouddisk.lucene.LuceneIndexQueueEvent;
 import com.jmal.clouddisk.model.GridFSBO;
 import com.jmal.clouddisk.model.Metadata;
+import com.jmal.clouddisk.model.file.FileDocument;
+import com.jmal.clouddisk.model.file.FileHistoryDTO;
 import com.jmal.clouddisk.office.OfficeHistory;
 import com.jmal.clouddisk.oss.AbstractOssObject;
+import com.jmal.clouddisk.oss.IOssService;
+import com.jmal.clouddisk.oss.OssConfigService;
 import com.jmal.clouddisk.oss.web.WebOssService;
 import com.jmal.clouddisk.service.Constants;
-import com.jmal.clouddisk.service.IFileService;
 import com.jmal.clouddisk.service.IFileVersionService;
-import com.jmal.clouddisk.service.IUserService;
 import com.jmal.clouddisk.util.CaffeineUtil;
+import com.jmal.clouddisk.util.FileNameUtils;
+import com.jmal.clouddisk.util.MyFileUtils;
+import com.jmal.clouddisk.util.Pair;
 import com.jmal.clouddisk.util.ResponseResult;
 import com.jmal.clouddisk.util.ResultUtil;
-import com.mongodb.client.gridfs.model.GridFSFile;
-import io.reactivex.rxjava3.core.Completable;
-import io.reactivex.rxjava3.schedulers.Schedulers;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.catalina.connector.ClientAbortException;
 import org.apache.commons.io.IOUtils;
-import org.bson.Document;
-import org.jetbrains.annotations.NotNull;
 import org.mozilla.universalchardet.UniversalDetector;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.context.ApplicationListener;
 import org.springframework.core.io.InputStreamResource;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
-import org.springframework.data.mongodb.core.MongoTemplate;
-import org.springframework.data.mongodb.core.query.Criteria;
-import org.springframework.data.mongodb.core.query.Query;
-import org.springframework.data.mongodb.core.query.Update;
-import org.springframework.data.mongodb.gridfs.GridFsResource;
-import org.springframework.data.mongodb.gridfs.GridFsTemplate;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
-import java.io.*;
-import java.nio.charset.Charset;
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
-import java.util.zip.GZIPInputStream;
-import java.util.zip.GZIPOutputStream;
-
-import static com.jmal.clouddisk.service.Constants.UPDATE_DATE;
+import java.util.stream.IntStream;
 
 /**
  * @author jmal
@@ -73,53 +75,52 @@ import static com.jmal.clouddisk.service.Constants.UPDATE_DATE;
 @Slf4j
 @RequiredArgsConstructor
 @Service
-public class FileVersionServiceImpl implements IFileVersionService {
+public class FileVersionServiceImpl implements IFileVersionService, ApplicationListener<FileVersionEvent> {
 
-    private static final String COLLECTION_NAME = "fs.files";
+    private final CommonUserFileService commonUserFileService;
 
-    private final CommonFileService commonFileService;
+    private final FileService fileService;
 
-    private final GridFsTemplate gridFsTemplate;
+    private final IFileHistoryDAO fileHistoryDAO;
 
-    private final MongoTemplate mongoTemplate;
+    private final IFileDAO fileDAO;
 
     private final FileProperties fileProperties;
 
-    private final IFileService fileService;
-
     private final UserLoginHolder userLoginHolder;
 
-    private final IUserService userService;
-
-    private final LuceneService luceneService;
+    private final ApplicationEventPublisher eventPublisher;
 
     private final Cache<String, Object> fileLocks = Caffeine.newBuilder()
-            .expireAfterAccess(10, TimeUnit.MINUTES) // 例如：10分钟不访问就过期
-            .maximumSize(10_000) // 例如：最多缓存10000个文件路径的锁
+            .expireAfterAccess(10, TimeUnit.MINUTES)
+            .maximumSize(10_0000)
             .build();
 
     @Override
-    public void saveFileVersion(String fileUsername, String relativePath, String userId) {
-        saveFileVersion(fileUsername, relativePath, userId, userLoginHolder.getUsername());
+    public void onApplicationEvent(FileVersionEvent event) {
+        saveFileVersion(event.getFileUsername(), event.getPath(), event.getUserId(), event.getOperator());
     }
 
     private void saveFileVersion(String fileUsername, String relativePath, String userId, String operator) {
         File file = new File(Paths.get(fileProperties.getRootDir(), fileUsername, relativePath).toString());
+        if (!file.exists() || !file.isFile()) {
+            return;
+        }
         String filepath = Paths.get(fileUsername, relativePath).toString();
-        Object lock = fileLocks.get(filepath, k -> new Object());
+        Object lock = fileLocks.get(filepath, _ -> new Object());
         if (lock != null) {
             synchronized (lock) {
                 if (CaffeineUtil.hasFileHistoryCache(filepath)) {
                     return;
                 }
-                FileDocument fileDocument = commonFileService.getFileDocumentByPath(filepath, userId);
+                FileDocument fileDocument = commonUserFileService.getFileDocumentByPath(filepath, userId);
                 long size = file.length();
-                String updateDate = fileDocument.getUpdateDate().format(DateTimeFormatter.ofPattern(DatePattern.NORM_DATETIME_PATTERN));
-                Metadata metadata = setMetadata(size, filepath, file.getName(), updateDate, operator);
+                String updateDate = CommonUserFileService.getFileLastModifiedTime(file).format(DateTimeFormatter.ofPattern(DatePattern.NORM_DATETIME_PATTERN));
+                Metadata metadata = setMetadata(size, filepath, file.getName(), updateDate, operator, getCharset(file));
                 if (metadata == null) return;
                 try (InputStream inputStream = new FileInputStream(file);
-                     InputStream gzipInputStream = gzipCompress(inputStream, metadata)) {
-                    gridFsTemplate.store(gzipInputStream, fileDocument.getId(), metadata);
+                     InputStream gzipInputStream = MyFileUtils.gzipCompress(inputStream, metadata.getCompression())) {
+                    fileHistoryDAO.store(gzipInputStream, fileDocument.getId(), metadata);
                     CaffeineUtil.setFileHistoryCache(filepath);
                 } catch (IOException e) {
                     log.error(e.getMessage(), e);
@@ -128,37 +129,24 @@ public class FileVersionServiceImpl implements IFileVersionService {
         }
     }
 
-    @Override
-    public void asyncSaveFileVersion(String fileUsername, File file, String operator) {
-        Path physicalPath = file.toPath();
-        Path userRootPath = Paths.get(fileProperties.getRootDir(), fileUsername);
-        Path relativeNioPath = userRootPath.relativize(physicalPath);
-        Completable.fromAction(() -> saveFileVersion(fileUsername, relativeNioPath.toString(), userService.getUserIdByUserName(fileUsername), operator)).subscribeOn(Schedulers.io()).subscribe();
+    private static String getCharset(File file) {
+        String charset;
+        try {
+            charset = UniversalDetector.detectCharset(file);
+        } catch (IOException e) {
+            charset = CharsetUtil.UTF_8;
+        }
+        return charset;
     }
 
-
-    @Override
-    public void saveFileVersion(AbstractOssObject abstractOssObject, String fileId) {
-        Object lock = fileLocks.get(fileId, k -> new Object());
-        if (lock != null) {
-            synchronized (lock) {
-                if (CaffeineUtil.hasFileHistoryCache(fileId)) {
-                    return;
-                }
-                long size = abstractOssObject.getContentLength();
-                String filename = Paths.get(abstractOssObject.getKey()).getFileName().toString();
-                String updateDate = DateUtil.format(abstractOssObject.getFileInfo().getLastModified(), DateTimeFormatter.ofPattern(DatePattern.NORM_DATETIME_PATTERN));
-                Metadata metadata = setMetadata(size, fileId, filename, updateDate, userLoginHolder.getUsername());
-                if (metadata == null) return;
-                try (InputStream inputStream = abstractOssObject.getInputStream();
-                     InputStream gzipInputStream = gzipCompress(inputStream, metadata)) {
-                    gridFsTemplate.store(gzipInputStream, fileId, metadata);
-                    CaffeineUtil.setFileHistoryCache(fileId);
-                } catch (IOException e) {
-                    log.error(e.getMessage(), e);
-                }
-            }
+    private static String getCharset(InputStream inputStream) {
+        String charset;
+        try (inputStream) {
+            charset = UniversalDetector.detectCharset(inputStream);
+        } catch (Exception e) {
+            charset = CharsetUtil.UTF_8;
         }
+        return charset;
     }
 
     /**
@@ -169,13 +157,14 @@ public class FileVersionServiceImpl implements IFileVersionService {
      * @param filename   filename
      * @param updateDate 文件最后修改时间
      */
-    private static Metadata setMetadata(long size, String filepath, String filename, String updateDate, String username) {
+    private static Metadata setMetadata(long size, String filepath, String filename, String updateDate, String username, String charset) {
         Metadata metadata = new Metadata();
         metadata.setFilepath(filepath);
         metadata.setFilename(filename);
         metadata.setTime(updateDate);
         metadata.setSize(size);
         metadata.setOperator(username);
+        metadata.setCharset(charset);
         if (size == 0) {
             // 无内容，不用存历史版本
             return null;
@@ -186,57 +175,62 @@ public class FileVersionServiceImpl implements IFileVersionService {
         return metadata;
     }
 
-    /**
-     * 读取文件
-     *
-     * @param gridFSId GridFSId
-     * @return InputStream
-     */
-    public InputStream readFileVersion(String gridFSId) throws IOException {
-        GridFSFile gridFSFile = getGridFSFile(gridFSId);
-        return getInputStream(gridFSFile);
-    }
-
-    private InputStream getInputStream(GridFSFile gridFSFile) throws IOException {
-        GridFsResource gridFsResource = gridFsTemplate.getResource(gridFSFile);
-        return gzipDecompress(gridFsResource.getInputStream(), gridFSFile.getMetadata());
-    }
-
-    @NotNull
-    private GridFSFile getGridFSFile(String gridFSId) {
-        Query query = getQueryOfId(gridFSId);
-        return gridFsTemplate.findOne(query);
-    }
-
-    @NotNull
-    private static Query getQueryOfId(String gridFSId) {
-        Query query = new Query();
-        query.addCriteria(Criteria.where("_id").is(gridFSId));
-        return query;
-    }
-
-    public ResponseResult<List<GridFSBO>> listFileVersion(String fileId, Integer pageSize, Integer pageIndex) {
-        List<GridFSBO> gridFSBOList = new ArrayList<>();
-        Query query = new Query();
-        query.addCriteria(Criteria.where(Constants.FILENAME).is(fileId));
-        long count = mongoTemplate.count(query, COLLECTION_NAME);
-        if (count == 0) {
-            return ResultUtil.success(gridFSBOList).setCount(0);
+    private Pair<InputStream, String> getInputStream(FileHistoryDTO fileHistoryDTO) {
+        try {
+            InputStream inputStream = fileHistoryDAO.getInputStream(fileHistoryDTO.getFileId(), fileHistoryDTO.getId());
+            if (inputStream == null) {
+                return Pair.of(new ByteArrayInputStream(new byte[0]), CharsetUtil.UTF_8);
+            }
+            if (CharSequenceUtil.isBlank(fileHistoryDTO.getCharset())) {
+                // 没有保存字符集，自动检测
+                String charset = getCharset(fileHistoryDAO.getInputStream(fileHistoryDTO.getFileId(), fileHistoryDTO.getId()));
+                fileHistoryDTO.setCharset(charset);
+            }
+            return MyFileUtils.gzipDecompress(inputStream, "gzip".equals(fileHistoryDTO.getCompression()), fileHistoryDTO.getCharset());
+        } catch (IOException e) {
+            return Pair.of(new ByteArrayInputStream(new byte[0]), CharsetUtil.UTF_8);
         }
-        CommonFileService.setPage(pageSize, pageIndex, query);
-        query.with(Sort.by(Sort.Direction.DESC, Constants.UPLOAD_DATE));
-        gridFSBOList = mongoTemplate.find(query, GridFSBO.class, COLLECTION_NAME);
-        return ResultUtil.success(gridFSBOList).setCount(count);
     }
 
+    @Override
+    public ResponseResult<List<GridFSBO>> listFileVersion(String fileId, Integer pageSize, Integer pageIndex) {
+        Path prePath = Paths.get(fileId);
+        String ossPath = CaffeineUtil.getOssPath(prePath);
+        if (ossPath != null) {
+            String objectName = WebOssService.getObjectName(prePath, ossPath, false);
+            return getS3VersionListResult(pageSize, pageIndex, ossPath, objectName);
+        }
+        Sort sort = Sort.by(Sort.Direction.DESC, Constants.UPLOAD_DATE);
+        Page<GridFSBO> page = listFileVersionBySort(fileId, pageSize, pageIndex, sort);
+        return ResultUtil.success(page.getContent()).setCount(page.getTotalElements());
+    }
+
+
+    private static ResponseResult<List<GridFSBO>> getS3VersionListResult(Integer pageSize, Integer pageIndex, String ossPath, String objectName) {
+        IOssService ossService = OssConfigService.getOssStorageService(ossPath);
+        Page<GridFSBO> page = ossService.listObjectVersions(objectName, pageSize, pageIndex);
+        return ResultUtil.success(page.getContent()).setCount(page.getTotalElements());
+    }
+
+    private Page<GridFSBO> listFileVersionBySort(String fileId, Integer pageSize, Integer pageIndex, Sort sort) {
+        Pageable pageable = PageRequest.of(pageIndex - 1, pageSize, sort);
+        return fileHistoryDAO.findPageByFileId(fileId, pageable);
+    }
+
+    @Override
     public ResponseResult<List<OfficeHistory>> officeListFileVersion(String path, Integer pageSize, Integer pageIndex) {
-        ResponseResult<List<GridFSBO>> result = listFileVersion(path, pageSize, pageIndex);
-        List<OfficeHistory> officeHistoryList = result.getData().stream().map(gridFSBO -> {
+        Sort sort = Sort.by(Sort.Direction.ASC, Constants.UPLOAD_DATE);
+        Page<GridFSBO> page = listFileVersionBySort(path, pageSize, pageIndex, sort);
+        List<GridFSBO> gridFSBOList = page.getContent();
+        final long versionOffset = (long)(pageIndex - 1) * pageSize;
+        List<OfficeHistory> officeHistoryList = IntStream.range(0, gridFSBOList.size())
+                .mapToObj(i -> {
+                    GridFSBO gridFSBO = gridFSBOList.get(i);
             OfficeHistory officeHistory = new OfficeHistory();
             officeHistory.setCreated(gridFSBO.getMetadata().getTime());
             officeHistory.setKey(gridFSBO.getId());
-            // 将时间设置为版本号, 格式转换为MM-dd
-            officeHistory.setVersion(gridFSBO.getUploadDate().format(DateTimeFormatter.ofPattern("MM-dd")));
+            // 用顺序设置版本号
+            officeHistory.setVersion(Convert.toStr(versionOffset + i + 1));
             OfficeHistory.User user = new OfficeHistory.User();
             String username = gridFSBO.getMetadata().getOperator();
             if (CharSequenceUtil.isBlank(username)) {
@@ -247,7 +241,7 @@ public class FileVersionServiceImpl implements IFileVersionService {
             officeHistory.setUser(user);
             return officeHistory;
         }).toList();
-        return ResultUtil.success(officeHistoryList).setCount(result.getCount());
+        return ResultUtil.success(officeHistoryList).setCount(page.getTotalElements());
     }
 
     @Override
@@ -257,15 +251,16 @@ public class FileVersionServiceImpl implements IFileVersionService {
         Path prePth = Paths.get(username, path);
         String ossPath = CaffeineUtil.getOssPath(prePth);
         if (ossPath != null) {
-            fileId = WebOssService.getObjectName(prePth, ossPath, false);
+            String objectName = WebOssService.getObjectName(prePth, ossPath, false);
+            return getS3VersionListResult(pageSize, pageIndex, ossPath, objectName);
         } else {
-            Path filePath = Paths.get(URLUtil.decode(path));
+            Path filePath = Paths.get(FileNameUtils.decodeAndCheckPath(path));
             String relativePath = File.separator;
             if (filePath.getNameCount() > 1) {
                 relativePath += filePath.subpath(0, filePath.getNameCount() - 1) + File.separator;
             }
             String userId = userLoginHolder.getUserId();
-            FileDocument fileDocument = commonFileService.getFileDocumentByPath(relativePath, filePath.getFileName().toString(), userId);
+            FileDocument fileDocument = commonUserFileService.getFileDocumentByPath(relativePath, filePath.getFileName().toString(), userId);
             if (fileDocument == null) {
                 return ResultUtil.success(new ArrayList<>());
             }
@@ -274,27 +269,46 @@ public class FileVersionServiceImpl implements IFileVersionService {
             }
         }
         if (CharSequenceUtil.isBlank(fileId)) {
-            throw new CommonException(ExceptionType.FILE_NOT_FIND);
+            return ResultUtil.success(new ArrayList<>());
         }
         return listFileVersion(fileId, pageSize, pageIndex);
     }
 
     @Override
-    public FileDocument getFileById(String gridFSId) {
-        GridFSFile gridFSFile = getGridFSFile(gridFSId);
-        if (gridFSFile.getMetadata() == null) {
+    public FileDocument getFileById(String gridFSId, String fileId) {
+        Path prePath = Paths.get(fileId);
+        String ossPath = CaffeineUtil.getOssPath(prePath);
+        if (ossPath != null) {
+            String objectName = WebOssService.getObjectName(prePath, ossPath, false);
+            IOssService ossService = OssConfigService.getOssStorageService(ossPath);
+            AbstractOssObject abstractOssObject = ossService.getAbstractOssObject(objectName, gridFSId);
+            if (abstractOssObject == null) {
+                return null;
+            }
+            FileDocument fileDocument = new FileDocument();
+            fileDocument.setName(abstractOssObject.getFileInfo().getName());
+            fileDocument.setSize(abstractOssObject.getFileInfo().getSize());
+            try (InputStream inputStream = abstractOssObject.getInputStream()) {
+                String content = IOUtils.toString(inputStream, StandardCharsets.UTF_8);
+                fileDocument.setContentText(content);
+            } catch (IOException e) {
+                log.error(e.getMessage(), e);
+            }
+            return fileDocument;
+        }
+        FileHistoryDTO fileHistoryDTO = fileHistoryDAO.getFileHistoryDTO(gridFSId);
+        if (fileHistoryDTO == null) {
             return null;
         }
-        String fileId = gridFSFile.getFilename();
-        FileDocument fileDocument = fileService.getById(fileId);
+        FileDocument fileDocument = fileService.getById(fileHistoryDTO.getFileId());
         if (fileDocument == null) {
             return null;
         }
-        fileDocument.setSize(gridFSFile.getLength());
-        fileDocument.setName(gridFSFile.getMetadata().getString(Constants.FILENAME));
-        Charset charset = getCharset(gridFSFile);
-        try (InputStream inputStream = getInputStream(gridFSFile)) {
-            String content = IOUtils.toString(inputStream, charset);
+        fileDocument.setSize(fileHistoryDTO.getSize());
+        fileDocument.setName(fileHistoryDTO.getFilename());
+        Pair<InputStream, String> pair = getInputStream(fileHistoryDTO);
+        try (InputStream inputStream = pair.getLeft()) {
+            String content = IOUtils.toString(inputStream, pair.getRight());
             fileDocument.setContentText(content);
         } catch (IOException e) {
             log.error(e.getMessage(), e);
@@ -302,30 +316,21 @@ public class FileVersionServiceImpl implements IFileVersionService {
         return fileDocument;
     }
 
-    private Charset getCharset(GridFSFile gridFSFile) {
-        Charset charset = StandardCharsets.UTF_8;
-        try (InputStream inputStream = getInputStream(gridFSFile)) {
-            charset = Charset.forName(UniversalDetector.detectCharset(inputStream));
-        } catch (Exception e) {
-            return charset;
-        }
-        return charset;
-    }
-
     @Override
     public StreamingResponseBody getStreamFileById(String gridFSId) {
         return outputStream -> {
-            GridFSFile gridFSFile = getGridFSFile(gridFSId);
-            Charset charset = getCharset(gridFSFile);
-            try (InputStream inputStream = getInputStream(gridFSFile);
-                 InputStreamReader inputStreamReader = new InputStreamReader(inputStream, charset);
-                 BufferedReader bufferedReader = new BufferedReader(inputStreamReader)) {
-                String line;
-                while ((line = bufferedReader.readLine()) != null) {
-                    outputStream.write(line.getBytes());
-                    outputStream.write("\n".getBytes());
-                    outputStream.flush();
+            FileHistoryDTO fileHistoryDTO = fileHistoryDAO.getFileHistoryDTO(gridFSId);
+            if (fileHistoryDTO == null) {
+                return;
+            }
+            Pair<InputStream, String> pair = getInputStream(fileHistoryDTO);
+            try (InputStream inputStream = pair.getLeft()) {
+                byte[] buffer = new byte[8192];
+                int len;
+                while ((len = inputStream.read(buffer)) != -1) {
+                    outputStream.write(buffer, 0, len);
                 }
+                outputStream.flush();
             } catch (ClientAbortException ignored) {
                 // ignored
             } catch (IOException e) {
@@ -336,54 +341,50 @@ public class FileVersionServiceImpl implements IFileVersionService {
 
     @Override
     public void deleteAll(List<String> fileIds) {
-        try {
-            Query query = new Query();
-            query.addCriteria(Criteria.where(Constants.FILENAME).in(fileIds));
-            gridFsTemplate.delete(query);
-        } catch (Exception e) {
-            // ignore
-        }
+        fileHistoryDAO.deleteAllByFileIdIn(fileIds);
     }
 
     @Override
     public void deleteAll(String fileId) {
-        try {
-            Query query = new Query();
-            query.addCriteria(Criteria.where(Constants.FILENAME).is(fileId));
-            gridFsTemplate.delete(query);
-        } catch (Exception e) {
-            // ignore
-        }
+        fileHistoryDAO.deleteAllByFileIdIn(List.of(fileId));
     }
 
     @Override
-    public void deleteOne(String id) {
-        try {
-            Query query = new Query();
-            query.addCriteria(Criteria.where("_id").is(id));
-            gridFsTemplate.delete(query);
-        } catch (Exception e) {
-            // ignore
+    public void deleteOne(String id, String fileId) {
+        Path prePath = Paths.get(fileId);
+        String ossPath = CaffeineUtil.getOssPath(prePath);
+        if (ossPath != null) {
+            String objectName = WebOssService.getObjectName(prePath, ossPath, false);
+            IOssService ossService = OssConfigService.getOssStorageService(ossPath);
+            boolean deleted = ossService.deleteObject(objectName, id);
+            if (!deleted) {
+                throw new CommonException(ExceptionType.SYSTEM_ERROR.getCode(), "删除版本失败");
+            }
+            return;
         }
+        fileHistoryDAO.deleteByIdIn(List.of(id));
     }
 
     @Override
     public void rename(String sourceFileId, String destinationFileId) {
-        Query query = new Query();
-        query.addCriteria(Criteria.where(Constants.FILENAME).is(sourceFileId));
-        Update update = new Update();
-        update.set(Constants.FILENAME, destinationFileId);
-        mongoTemplate.updateMulti(query, update, COLLECTION_NAME);
+        fileHistoryDAO.updateFileId(sourceFileId, destinationFileId);
     }
 
     @Override
-    public Long recovery(String gridFSId) {
-        GridFSFile gridFSFile = getGridFSFile(gridFSId);
-        if (gridFSFile.getMetadata() == null) {
+    public Long recovery(String gridFSId, String fileId) {
+        Path prePath = Paths.get(fileId);
+        String ossPath = CaffeineUtil.getOssPath(prePath);
+        if (ossPath != null) {
+            String objectName = WebOssService.getObjectName(prePath, ossPath, false);
+            IOssService ossService = OssConfigService.getOssStorageService(ossPath);
+            ossService.restoreVersion(objectName, gridFSId);
+            return Instant.now().toEpochMilli();
+        }
+        FileHistoryDTO fileHistoryDTO = fileHistoryDAO.getFileHistoryDTO(gridFSId);
+        if (fileHistoryDTO == null) {
             throw new CommonException(ExceptionType.FILE_NOT_FIND);
         }
-        String fileId = gridFSFile.getFilename();
-        String filename = gridFSFile.getMetadata().getString(Constants.FILENAME);
+        fileId = fileHistoryDTO.getFileId();
         FileDocument fileDocument = fileService.getById(fileId);
         if (fileDocument == null) {
             throw new CommonException(ExceptionType.FILE_NOT_FIND);
@@ -392,7 +393,7 @@ public class FileVersionServiceImpl implements IFileVersionService {
         if (CharSequenceUtil.isBlank(username)) {
             throw new CommonException(ExceptionType.LOGIN_EXCEPTION);
         }
-        File file = Paths.get(fileProperties.getRootDir(), username, fileDocument.getPath(), filename).toFile();
+        File file = Paths.get(fileProperties.getRootDir(), username, fileDocument.getPath(), fileHistoryDTO.getFilename()).toFile();
         if (!file.exists()) {
             throw new CommonException(ExceptionType.FILE_NOT_FIND);
         }
@@ -400,13 +401,11 @@ public class FileVersionServiceImpl implements IFileVersionService {
             throw new CommonException(ExceptionType.LOCKED_RESOURCES);
         }
         LocalDateTime time = LocalDateTimeUtil.now();
-        try (InputStream inputStream = getInputStream(gridFSFile)) {
+        Pair<InputStream, String> pair = getInputStream(fileHistoryDTO);
+        try (InputStream inputStream = pair.getLeft()) {
             FileUtil.writeFromStream(inputStream, file);
-            Query query = new Query().addCriteria(Criteria.where("_id").is(fileId));
-            Update update = new Update();
-            update.set(UPDATE_DATE, time);
-            mongoTemplate.updateFirst(query, update, FileDocument.class);
-            luceneService.pushCreateIndexQueue(fileId);
+            fileDAO.setUpdateDateById(fileId, time);
+            eventPublisher.publishEvent(new LuceneIndexQueueEvent(this, fileId));
         } catch (IOException e) {
             log.error(e.getMessage(), e);
         }
@@ -414,69 +413,54 @@ public class FileVersionServiceImpl implements IFileVersionService {
     }
 
     @Override
-    public ResponseEntity<InputStreamResource> readHistoryFile(String gridFSId) {
-        GridFSFile gridFSFile = getGridFSFile(gridFSId);
-        if (gridFSFile.getMetadata() == null) {
+    public ResponseEntity<InputStreamResource> readHistoryFile(String gridFSId, String fileId) {
+        Path prePath = Paths.get(fileId);
+        String ossPath = CaffeineUtil.getOssPath(prePath);
+        if (ossPath != null) {
+            return getInputStreamResourceResponseEntity(gridFSId, prePath, ossPath);
+        }
+        FileHistoryDTO fileHistoryDTO = fileHistoryDAO.getFileHistoryDTO(gridFSId);
+        if (fileHistoryDTO == null) {
             return ResponseEntity.notFound().build();
         }
-        try (InputStream inputStream = getInputStream(gridFSFile)) {
+        Pair<InputStream, String> pair = getInputStream(fileHistoryDTO);
+        InputStream inputStream = pair.getLeft();
+        try {
             HttpHeaders headers = new HttpHeaders();
+            headers.add(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + URLEncoder.encode(fileHistoryDTO.getFilename(), StandardCharsets.UTF_8) + "\"");
             return ResponseEntity.ok()
                     .headers(headers)
                     .contentType(MediaType.parseMediaType("application/octet-stream"))
                     .body(new InputStreamResource(inputStream));
-        } catch (IOException e) {
+        } catch (Exception e) {
             log.error(e.getMessage(), e);
+            try {
+                inputStream.close();
+            } catch (Exception ignore) {
+            }
         }
         return ResponseEntity.notFound().build();
     }
 
-    /**
-     * gzip压缩
-     *
-     * @param inputStream 原始 inputStream
-     * @param metadata    自定义元数据
-     * @return 压缩后的 inputStream
-     */
-    public static InputStream gzipCompress(InputStream inputStream, Metadata metadata) {
-        if (metadata != null && !"gzip".equals(metadata.getCompression())) {
-            return inputStream;
+    private static ResponseEntity<InputStreamResource> getInputStreamResourceResponseEntity(String gridFSId, Path prePath, String ossPath) {
+        String objectName = WebOssService.getObjectName(prePath, ossPath, false);
+        IOssService ossService = OssConfigService.getOssStorageService(ossPath);
+        AbstractOssObject abstractOssObject = ossService.getAbstractOssObject(objectName, gridFSId);
+        if (abstractOssObject == null) {
+            return ResponseEntity.notFound().build();
         }
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        try (GZIPOutputStream gzipOut = new GZIPOutputStream(out)) {
-            byte[] buffer = new byte[1024];
-            int len;
-            while ((len = inputStream.read(buffer)) > 0) {
-                gzipOut.write(buffer, 0, len);
-            }
-        } catch (IOException e) {
+        try {
+            InputStream inputStream = abstractOssObject.getInputStream();
+            HttpHeaders headers = new HttpHeaders();
+            headers.add(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + URLEncoder.encode(abstractOssObject.getFileInfo().getName(), StandardCharsets.UTF_8) + "\"");
+            return ResponseEntity.ok()
+                    .headers(headers)
+                    .contentType(MediaType.parseMediaType("application/octet-stream"))
+                    .body(new InputStreamResource(inputStream));
+        } catch (Exception e) {
             log.error(e.getMessage(), e);
+            return ResponseEntity.notFound().build();
         }
-        return new ByteArrayInputStream(out.toByteArray());
-    }
-
-    /**
-     * gzip解压
-     *
-     * @param inputStream 压缩后的 inputStream
-     * @param metadata    自定义元数据
-     * @return 解压后的 inputStream
-     */
-    public static InputStream gzipDecompress(InputStream inputStream, Document metadata) {
-        if (metadata != null && !"gzip".equals(metadata.get("compression"))) {
-            return inputStream;
-        }
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        try (GZIPInputStream gzipIn = new GZIPInputStream(inputStream)) {
-            byte[] buffer = new byte[1024];
-            int len;
-            while ((len = gzipIn.read(buffer)) > 0) {
-                out.write(buffer, 0, len);
-            }
-        } catch (IOException e) {
-            log.error(e.getMessage(), e);
-        }
-        return new ByteArrayInputStream(out.toByteArray());
     }
 
 }

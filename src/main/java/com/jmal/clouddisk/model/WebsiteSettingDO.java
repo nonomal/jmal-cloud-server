@@ -1,6 +1,19 @@
 package com.jmal.clouddisk.model;
 
-import lombok.Data;
+import cn.hutool.core.util.StrUtil;
+import com.jmal.clouddisk.config.Reflective;
+import com.jmal.clouddisk.config.jpa.AuditableEntity;
+import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Table;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+import lombok.Setter;
+import lombok.ToString;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
+import org.springframework.data.mongodb.core.mapping.Document;
 
 import java.util.List;
 
@@ -9,8 +22,14 @@ import java.util.List;
  * @Description 网站设置
  * @Date 2020/11/5 2:45 下午
  */
-@Data
-public class WebsiteSettingDO {
+@Getter
+@Setter
+@ToString
+@RequiredArgsConstructor
+@Document(collection = "websiteSetting")
+@Entity
+@Table(name = "website_setting")
+public class WebsiteSettingDO extends AuditableEntity implements Reflective {
 
     /***
      * 站点背景大图
@@ -32,6 +51,18 @@ public class WebsiteSettingDO {
      * 网盘名称
      */
     String netdiskName;
+    /**
+     * 动态地址配置
+     */
+    @Column(name = "dynamic_address")
+    @JdbcTypeCode(SqlTypes.JSON)
+    private DynamicAddressConfig dynamicAddress;
+    /**
+     * 网盘个性化配置
+     */
+    @Column(name = "personalization")
+    @JdbcTypeCode(SqlTypes.JSON)
+    private NetdiskPersonalization personalization;
     /***
      * 站点地址
      */
@@ -51,10 +82,12 @@ public class WebsiteSettingDO {
     /***
      * 需要显示的独立页面
      */
+    @JdbcTypeCode(SqlTypes.JSON)
     List<String> alonePages;
     /***
      * 操作按钮
      */
+    @Column(columnDefinition = "TEXT")
     String operatingButtons;
     /***
      * 分类页面背景
@@ -89,10 +122,50 @@ public class WebsiteSettingDO {
     /**
      * 页脚html
      */
+    @Column(columnDefinition = "TEXT")
     String footerHtml;
 
     /**
      * iframe预览配置
      */
+    @Column(columnDefinition = "TEXT")
     String iframe;
+
+    @Schema(name = "forceEnable", title = "是否强制启用多因素认证")
+    Boolean mfaForceEnable;
+
+    public WebsiteSettingDTO toWebsiteSettingDTO() {
+        WebsiteSettingDTO websiteSettingDTO = new WebsiteSettingDTO();
+        websiteSettingDTO.setBackgroundSite(this.backgroundSite);
+        websiteSettingDTO.setBackgroundTextSite(this.backgroundTextSite);
+        websiteSettingDTO.setBackgroundDescSite(this.backgroundDescSite);
+        websiteSettingDTO.setNetdiskLogo(this.netdiskLogo);
+        websiteSettingDTO.setNetdiskName(this.netdiskName);
+        websiteSettingDTO.setDynamicAddress(this.dynamicAddress);
+        websiteSettingDTO.setPersonalization(this.personalization);
+        websiteSettingDTO.setSiteUrl(this.siteUrl);
+        websiteSettingDTO.setSiteIco(this.siteIco);
+        websiteSettingDTO.setSiteLogo(this.siteLogo);
+        websiteSettingDTO.setSiteName(this.siteName);
+        websiteSettingDTO.setAlonePages(this.alonePages);
+        websiteSettingDTO.setOperatingButtons(this.operatingButtons);
+        websiteSettingDTO.setCategoryBackground(this.categoryBackground);
+        websiteSettingDTO.setArchiveBackground(this.archiveBackground);
+        websiteSettingDTO.setTagBackground(this.tagBackground);
+        websiteSettingDTO.setCopyright(this.copyright);
+        websiteSettingDTO.setRecordPermissionNum(this.recordPermissionNum);
+        websiteSettingDTO.setNetworkRecordNumber(this.networkRecordNumber);
+        websiteSettingDTO.setNetworkRecordNumberStr(this.networkRecordNumberStr);
+        websiteSettingDTO.setFooterHtml(this.footerHtml);
+        websiteSettingDTO.setIframe(this.iframe);
+        websiteSettingDTO.setMfaForceEnable(this.mfaForceEnable);
+        return websiteSettingDTO;
+    }
+
+    public String getNetdiskName() {
+        if (personalization != null && !StrUtil.isBlank(personalization.getName())) {
+            return personalization.getName();
+        }
+        return netdiskName;
+    }
 }

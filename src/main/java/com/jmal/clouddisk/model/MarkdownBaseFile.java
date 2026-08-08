@@ -1,5 +1,7 @@
 package com.jmal.clouddisk.model;
 
+import com.jmal.clouddisk.config.Reflective;
+import com.jmal.clouddisk.model.file.FileBase;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
 
@@ -12,7 +14,7 @@ import java.util.List;
  */
 @Data
 @EqualsAndHashCode(callSuper = true)
-public class MarkdownBaseFile extends FileBase {
+public class MarkdownBaseFile extends FileBase implements Reflective {
 
     private String username;
     /***
@@ -34,7 +36,7 @@ public class MarkdownBaseFile extends FileBase {
     /***
      * 分类Id集合
      */
-    private String[] categoryIds;
+    private List<String> categoryIds;
 
     /***
      * 分类集合
@@ -43,10 +45,14 @@ public class MarkdownBaseFile extends FileBase {
     /***
      * 标签Id集合
      */
-    private String[] tagIds;
+    private List<String> tagIds;
     /***
      * 标签集合
      */
     private List<TagDO> tags;
+
+    private String userId;
+
+    private String suffix;
 
 }

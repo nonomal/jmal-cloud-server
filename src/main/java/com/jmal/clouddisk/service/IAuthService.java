@@ -3,6 +3,7 @@ package com.jmal.clouddisk.service;
 import com.jmal.clouddisk.model.LdapConfigDTO;
 import com.jmal.clouddisk.model.rbac.ConsumerDTO;
 import com.jmal.clouddisk.util.ResponseResult;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.ldap.core.LdapTemplate;
 
@@ -15,19 +16,30 @@ public interface IAuthService {
 
     /**
      * 登录
+     * @param request HttpServletRequest
      * @param response HttpServletResponse
      * @param userDTO ConsumerDTO
      * @return ResponseResult
      */
-    ResponseResult<Object> login(HttpServletResponse response, ConsumerDTO userDTO);
+    ResponseResult<Object> login(HttpServletRequest request, HttpServletResponse response, ConsumerDTO userDTO);
 
     /**
      * 验证TOTP码
+     * @param request HttpServletRequest
      * @param response HttpServletResponse
      * @param consumerDTO ConsumerDTO
      * @return ResponseResult
      */
-    ResponseResult<Object> verifyTotp(HttpServletResponse response, ConsumerDTO consumerDTO);
+    ResponseResult<Object> verifyTotp(HttpServletRequest request, HttpServletResponse response, ConsumerDTO consumerDTO);
+
+    /**
+     * 初始化并验证TOTP码
+     * @param request HttpServletRequest
+     * @param response HttpServletResponse
+     * @param consumerDTO ConsumerDTO
+     * @return ResponseResult
+     */
+    ResponseResult<Object> initVerifyTotp(HttpServletRequest request, HttpServletResponse response, ConsumerDTO consumerDTO);
 
     /**
      * 登出
